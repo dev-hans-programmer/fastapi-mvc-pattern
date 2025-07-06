@@ -1,148 +1,315 @@
 """
-Logging configuration and utilities
+Logging configuration and setup
 """
+
 import logging
 import logging.config
+import os
 import sys
-from typing import Dict, Any
+from datetime import datetime
 from pathlib import Path
+from typing import Optional, Dict, Any
+import json
 
-from app.core.config import settings
+from app.core.config import get_settings
+
+settings = get_settings()
 
 
-class StructuredFormatter(logging.Formatter):
-    """Custom formatter for structured logging."""
+class JSONFormatter(logging.Formatter):
+    """
+    JSON formatter for structured logging
+    """
     
     def format(self, record: logging.LogRecord) -> str:
-        """Format log record with structured information."""
-        # Add extra fields to the record
-        record.environment = settings.ENVIRONMENT
-        record.service = settings.PROJECT_NAME
+        """
+        Format log record as JSON
+        """
+        # Create log entry
+        log_entry = {
+            "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "function": record.funcName,
+            "line": record.lineno,
+            "thread": record.thread,
+            "thread_name": record.threadName,
+            "process": record.process,
+            "process_name": record.processName,
+        }
         
-        # Call parent formatter
-        return super().format(record)
+        # Add exception info if present
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        
+        # Add extra fields
+        for key, value in record.__dict__.items():
+            if key not in [
+                "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+                "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+                "created", "msecs", "relativeCreated", "thread", "threadName",
+                "processName", "process", "message"
+            ]:
+                log_entry[key] = value
+        
+        return json.dumps(log_entry, ensure_ascii=False)
 
 
-def get_logging_config() -> Dict[str, Any]:
-    """Get logging configuration based on environment."""
+class ColoredFormatter(logging.Formatter):
+    """
+    Colored formatter for console output
+    """
     
-    # Create logs directory if it doesn't exist
-    logs_dir = Path("logs")
-    logs_dir.mkdir(exist_ok=True)
+    # Color codes
+    COLORS = {
+        'DEBUG': '\033[36m',      # Cyan
+        'INFO': '\033[32m',       # Green
+        'WARNING': '\033[33m',    # Yellow
+        'ERROR': '\033[31m',      # Red
+        'CRITICAL': '\033[35m',   # Magenta
+        'RESET': '\033[0m'        # Reset
+    }
     
-    config = {
+    def format(self, record: logging.LogRecord) -> str:
+        """
+        Format log record with colors
+        """
+        # Add color to levelname
+        levelname = record.levelname
+        if levelname in self.COLORS:
+            colored_levelname = f"{self.COLORS[levelname]}{levelname}{self.COLORS['RESET']}"
+            record.levelname = colored_levelname
+        
+        # Format the message
+        formatted = super().format(record)
+        
+        # Reset levelname for other formatters
+        record.levelname = levelname
+        
+        return formatted
+
+
+def setup_logging(
+    log_level: Optional[str] = None,
+    log_file: Optional[str] = None,
+    json_format: bool = False,
+    enable_colors: bool = True,
+) -> None:
+    """
+    Setup logging configuration
+    """
+    log_level = log_level or settings.LOG_LEVEL
+    log_file = log_file or settings.LOG_FILE
+    
+    # Create logs directory if using file logging
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Configure logging
+    logging_config = {
         "version": 1,
         "disable_existing_loggers": False,
         "formatters": {
-            "detailed": {
-                "()": StructuredFormatter,
-                "format": "%(asctime)s - %(name)s - %(levelname)s - %(environment)s - %(service)s - %(message)s",
-                "datefmt": "%Y-%m-%d %H:%M:%S"
+            "standard": {
+                "format": settings.LOG_FORMAT,
+                "datefmt": "%Y-%m-%d %H:%M:%S",
             },
-            "simple": {
-                "format": "%(levelname)s - %(message)s"
+            "detailed": {
+                "format": (
+                    "%(asctime)s - %(name)s - %(levelname)s - "
+                    "%(module)s:%(funcName)s:%(lineno)d - %(message)s"
+                ),
+                "datefmt": "%Y-%m-%d %H:%M:%S",
             },
             "json": {
-                "()": "pythonjsonlogger.jsonlogger.JsonFormatter",
-                "format": "%(asctime)s %(name)s %(levelname)s %(environment)s %(service)s %(message)s"
-            }
+                "()": JSONFormatter,
+            },
+            "colored": {
+                "()": ColoredFormatter,
+                "format": settings.LOG_FORMAT,
+                "datefmt": "%Y-%m-%d %H:%M:%S",
+            },
         },
         "handlers": {
             "console": {
                 "class": "logging.StreamHandler",
-                "level": settings.LOG_LEVEL,
-                "formatter": "detailed" if settings.is_development else "json",
-                "stream": sys.stdout
+                "level": log_level,
+                "formatter": "colored" if enable_colors and not json_format else "standard",
+                "stream": sys.stdout,
             },
-            "file": {
-                "class": "logging.handlers.RotatingFileHandler",
-                "level": settings.LOG_LEVEL,
-                "formatter": "detailed",
-                "filename": "logs/app.log",
-                "maxBytes": 10485760,  # 10MB
-                "backupCount": 5,
-                "encoding": "utf8"
-            },
-            "error_file": {
-                "class": "logging.handlers.RotatingFileHandler",
-                "level": "ERROR",
-                "formatter": "detailed",
-                "filename": "logs/error.log",
-                "maxBytes": 10485760,  # 10MB
-                "backupCount": 5,
-                "encoding": "utf8"
-            }
         },
         "loggers": {
             "": {  # Root logger
-                "level": settings.LOG_LEVEL,
-                "handlers": ["console", "file", "error_file"],
-                "propagate": False
+                "handlers": ["console"],
+                "level": log_level,
+                "propagate": False,
             },
             "uvicorn": {
-                "level": "INFO",
                 "handlers": ["console"],
-                "propagate": False
+                "level": "INFO",
+                "propagate": False,
             },
             "uvicorn.access": {
-                "level": "INFO",
                 "handlers": ["console"],
-                "propagate": False
+                "level": "INFO",
+                "propagate": False,
             },
             "sqlalchemy": {
+                "handlers": ["console"],
                 "level": "WARNING",
-                "handlers": ["console", "file"],
-                "propagate": False
+                "propagate": False,
             },
             "celery": {
+                "handlers": ["console"],
                 "level": "INFO",
-                "handlers": ["console", "file"],
-                "propagate": False
-            }
-        }
+                "propagate": False,
+            },
+        },
     }
     
-    # In production, remove console handler and use only file handlers
-    if settings.is_production:
-        config["loggers"][""]["handlers"] = ["file", "error_file"]
+    # Add file handler if log file is specified
+    if log_file:
+        logging_config["handlers"]["file"] = {
+            "class": "logging.handlers.RotatingFileHandler",
+            "level": log_level,
+            "formatter": "json" if json_format else "detailed",
+            "filename": log_file,
+            "maxBytes": 10 * 1024 * 1024,  # 10MB
+            "backupCount": 5,
+            "encoding": "utf-8",
+        }
+        
+        # Add file handler to all loggers
+        for logger_name in logging_config["loggers"]:
+            logging_config["loggers"][logger_name]["handlers"].append("file")
     
-    return config
-
-
-def setup_logging() -> None:
-    """Setup logging configuration."""
-    config = get_logging_config()
-    logging.config.dictConfig(config)
+    # Apply logging configuration
+    logging.config.dictConfig(logging_config)
     
-    # Get the root logger
-    logger = logging.getLogger()
-    
-    logger.info(f"Logging setup complete for environment: {settings.ENVIRONMENT}")
-    logger.info(f"Log level: {settings.LOG_LEVEL}")
+    # Log the configuration
+    logger = logging.getLogger(__name__)
+    logger.info(f"Logging configured - Level: {log_level}, File: {log_file or 'None'}")
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Get a logger with the specified name."""
+    """
+    Get logger instance
+    """
     return logging.getLogger(name)
 
 
-# Context manager for logging with extra context
-class LogContext:
-    """Context manager for adding extra context to log messages."""
+def log_request(
+    method: str,
+    url: str,
+    status_code: int,
+    duration: float,
+    user_id: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Log HTTP request
+    """
+    logger = get_logger("request")
     
-    def __init__(self, logger: logging.Logger, **kwargs):
-        self.logger = logger
-        self.extra = kwargs
-        self.old_extra = getattr(logger, '_extra', {})
+    log_data = {
+        "method": method,
+        "url": url,
+        "status_code": status_code,
+        "duration": duration,
+        "user_id": user_id,
+    }
     
-    def __enter__(self):
-        self.logger._extra = {**self.old_extra, **self.extra}
-        return self.logger
+    if extra:
+        log_data.update(extra)
     
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.logger._extra = self.old_extra
+    logger.info(f"{method} {url} - {status_code} - {duration:.3f}s", extra=log_data)
 
 
-def log_with_context(logger: logging.Logger, **kwargs):
-    """Create a log context with extra information."""
-    return LogContext(logger, **kwargs)
+def log_error(
+    error: Exception,
+    context: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
+) -> None:
+    """
+    Log error with context
+    """
+    logger = get_logger("error")
+    
+    log_data = {
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "user_id": user_id,
+    }
+    
+    if context:
+        log_data.update(context)
+    
+    logger.error(f"Error: {error}", extra=log_data, exc_info=True)
+
+
+def log_background_task(
+    task_name: str,
+    task_id: str,
+    status: str,
+    duration: Optional[float] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Log background task execution
+    """
+    logger = get_logger("background_task")
+    
+    log_data = {
+        "task_name": task_name,
+        "task_id": task_id,
+        "status": status,
+        "duration": duration,
+    }
+    
+    if extra:
+        log_data.update(extra)
+    
+    message = f"Background task {task_name} [{task_id}] - {status}"
+    if duration:
+        message += f" - {duration:.3f}s"
+    
+    logger.info(message, extra=log_data)
+
+
+def log_database_operation(
+    operation: str,
+    table: str,
+    record_id: Optional[str] = None,
+    duration: Optional[float] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Log database operation
+    """
+    logger = get_logger("database")
+    
+    log_data = {
+        "operation": operation,
+        "table": table,
+        "record_id": record_id,
+        "duration": duration,
+    }
+    
+    if extra:
+        log_data.update(extra)
+    
+    message = f"Database {operation} on {table}"
+    if record_id:
+        message += f" [{record_id}]"
+    if duration:
+        message += f" - {duration:.3f}s"
+    
+    logger.info(message, extra=log_data)
+
+
+# Setup logging on module import
+if not logging.getLogger().handlers:
+    setup_logging()

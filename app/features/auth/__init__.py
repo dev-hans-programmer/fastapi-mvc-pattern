@@ -1,3 +1,3 @@
 """
-Authentication and authorization feature
+Authentication feature module
 """

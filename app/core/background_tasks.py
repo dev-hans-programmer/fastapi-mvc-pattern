@@ -1,13 +1,20 @@
 """
 Background task processing with Celery
 """
+
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Callable
 from celery import Celery
 from celery.result import AsyncResult
+from celery.exceptions import Retry, WorkerLostError
+from datetime import datetime, timedelta
+import asyncio
+import json
 
-from app.core.config import settings
+from app.core.config import get_settings
+from app.core.logging import log_background_task
 
+settings = get_settings()
 logger = logging.getLogger(__name__)
 
 # Create Celery app
@@ -15,31 +22,48 @@ celery_app = Celery(
     "fastapi_backend",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=["app.worker.tasks"]
+    include=["app.core.background_tasks"],
 )
 
-# Celery configuration
+# Configure Celery
 celery_app.conf.update(
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    timezone="UTC",
+    task_serializer=settings.CELERY_TASK_SERIALIZER,
+    accept_content=settings.CELERY_ACCEPT_CONTENT,
+    result_serializer=settings.CELERY_RESULT_SERIALIZER,
+    timezone=settings.CELERY_TIMEZONE,
     enable_utc=True,
     task_track_started=True,
-    task_default_queue="default",
-    task_routes={
-        "app.worker.tasks.send_email": {"queue": "email"},
-        "app.worker.tasks.process_data": {"queue": "data_processing"},
-        "app.worker.tasks.generate_report": {"queue": "reports"},
-    },
+    task_time_limit=30 * 60,  # 30 minutes
+    task_soft_time_limit=25 * 60,  # 25 minutes
     worker_prefetch_multiplier=1,
-    task_acks_late=True,
     worker_max_tasks_per_child=1000,
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    task_routes={
+        "app.core.background_tasks.send_email": {"queue": "email"},
+        "app.core.background_tasks.process_file": {"queue": "file_processing"},
+        "app.core.background_tasks.generate_report": {"queue": "reports"},
+        "app.core.background_tasks.cleanup_task": {"queue": "cleanup"},
+    },
 )
+
+
+class TaskStatus:
+    """
+    Task status constants
+    """
+    PENDING = "PENDING"
+    STARTED = "STARTED"
+    SUCCESS = "SUCCESS"
+    FAILURE = "FAILURE"
+    RETRY = "RETRY"
+    REVOKED = "REVOKED"
 
 
 class BackgroundTaskManager:
-    """Manager for background tasks using Celery."""
+    """
+    Background task manager
+    """
     
     def __init__(self):
         self.celery_app = celery_app
@@ -48,197 +72,459 @@ class BackgroundTaskManager:
         self,
         task_name: str,
         *args,
-        queue: Optional[str] = None,
-        countdown: Optional[int] = None,
-        eta: Optional[Any] = None,
-        expires: Optional[Any] = None,
         **kwargs
     ) -> str:
-        """Submit a task to Celery."""
+        """
+        Submit a background task
+        """
         try:
-            task = self.celery_app.send_task(
-                task_name,
-                args=args,
-                kwargs=kwargs,
-                queue=queue,
-                countdown=countdown,
-                eta=eta,
-                expires=expires,
-            )
-            
-            logger.info(f"Task {task_name} submitted with ID: {task.id}")
-            return task.id
-        
+            result = self.celery_app.send_task(task_name, args, kwargs)
+            logger.info(f"Task submitted: {task_name} [{result.id}]")
+            return result.id
         except Exception as e:
-            logger.error(f"Failed to submit task {task_name}: {str(e)}")
+            logger.error(f"Failed to submit task {task_name}: {e}")
             raise
     
     def get_task_status(self, task_id: str) -> Dict[str, Any]:
-        """Get the status of a task."""
+        """
+        Get task status
+        """
         try:
             result = AsyncResult(task_id, app=self.celery_app)
             
-            return {
+            status_info = {
                 "task_id": task_id,
                 "status": result.status,
-                "result": result.result if result.ready() else None,
-                "traceback": result.traceback if result.failed() else None,
-                "info": result.info,
+                "result": result.result,
+                "traceback": result.traceback,
+                "date_done": result.date_done,
+                "successful": result.successful(),
+                "failed": result.failed(),
             }
-        
+            
+            if result.status == TaskStatus.STARTED:
+                status_info["info"] = result.info
+            
+            return status_info
+            
         except Exception as e:
-            logger.error(f"Failed to get task status for {task_id}: {str(e)}")
+            logger.error(f"Failed to get task status {task_id}: {e}")
             return {
                 "task_id": task_id,
-                "status": "ERROR",
-                "error": str(e)
+                "status": "UNKNOWN",
+                "error": str(e),
             }
     
     def cancel_task(self, task_id: str) -> bool:
-        """Cancel a task."""
+        """
+        Cancel a task
+        """
         try:
             self.celery_app.control.revoke(task_id, terminate=True)
-            logger.info(f"Task {task_id} cancelled")
+            logger.info(f"Task cancelled: {task_id}")
             return True
-        
         except Exception as e:
-            logger.error(f"Failed to cancel task {task_id}: {str(e)}")
+            logger.error(f"Failed to cancel task {task_id}: {e}")
             return False
     
     def get_active_tasks(self) -> Dict[str, Any]:
-        """Get all active tasks."""
+        """
+        Get active tasks
+        """
         try:
             inspect = self.celery_app.control.inspect()
-            active_tasks = inspect.active()
-            return active_tasks or {}
-        
+            return {
+                "active": inspect.active(),
+                "scheduled": inspect.scheduled(),
+                "reserved": inspect.reserved(),
+            }
         except Exception as e:
-            logger.error(f"Failed to get active tasks: {str(e)}")
-            return {}
-    
-    def get_scheduled_tasks(self) -> Dict[str, Any]:
-        """Get all scheduled tasks."""
-        try:
-            inspect = self.celery_app.control.inspect()
-            scheduled_tasks = inspect.scheduled()
-            return scheduled_tasks or {}
-        
-        except Exception as e:
-            logger.error(f"Failed to get scheduled tasks: {str(e)}")
+            logger.error(f"Failed to get active tasks: {e}")
             return {}
     
     def get_worker_stats(self) -> Dict[str, Any]:
-        """Get worker statistics."""
+        """
+        Get worker statistics
+        """
         try:
             inspect = self.celery_app.control.inspect()
-            stats = inspect.stats()
-            return stats or {}
-        
+            return {
+                "stats": inspect.stats(),
+                "registered": inspect.registered(),
+                "ping": inspect.ping(),
+            }
         except Exception as e:
-            logger.error(f"Failed to get worker stats: {str(e)}")
+            logger.error(f"Failed to get worker stats: {e}")
             return {}
-    
-    def purge_queue(self, queue_name: str) -> int:
-        """Purge a queue."""
-        try:
-            result = self.celery_app.control.purge()
-            logger.info(f"Queue {queue_name} purged")
-            return result
-        
-        except Exception as e:
-            logger.error(f"Failed to purge queue {queue_name}: {str(e)}")
-            return 0
 
 
 # Global task manager instance
-background_task_manager = BackgroundTaskManager()
+task_manager = BackgroundTaskManager()
 
 
-# Convenience functions
+# Task decorators and utilities
+def task_wrapper(name: str, bind: bool = True, retry_kwargs: Optional[Dict] = None):
+    """
+    Decorator for creating Celery tasks with logging
+    """
+    def decorator(func: Callable) -> Callable:
+        @celery_app.task(name=name, bind=bind)
+        def wrapper(self, *args, **kwargs):
+            task_id = self.request.id
+            start_time = datetime.now()
+            
+            try:
+                log_background_task(
+                    task_name=name,
+                    task_id=task_id,
+                    status="STARTED",
+                    extra={"args": args, "kwargs": kwargs}
+                )
+                
+                # Execute the task
+                result = func(*args, **kwargs)
+                
+                duration = (datetime.now() - start_time).total_seconds()
+                log_background_task(
+                    task_name=name,
+                    task_id=task_id,
+                    status="SUCCESS",
+                    duration=duration,
+                    extra={"result": result}
+                )
+                
+                return result
+                
+            except Exception as e:
+                duration = (datetime.now() - start_time).total_seconds()
+                log_background_task(
+                    task_name=name,
+                    task_id=task_id,
+                    status="FAILURE",
+                    duration=duration,
+                    extra={"error": str(e)}
+                )
+                
+                # Retry logic
+                if retry_kwargs:
+                    try:
+                        raise self.retry(exc=e, **retry_kwargs)
+                    except Retry:
+                        raise
+                
+                raise
+        
+        return wrapper
+    return decorator
+
+
+# Background tasks
+@task_wrapper("app.core.background_tasks.send_email")
+def send_email(
+    to_email: str,
+    subject: str,
+    body: str,
+    from_email: Optional[str] = None,
+    html_body: Optional[str] = None,
+    attachments: Optional[list] = None,
+) -> Dict[str, Any]:
+    """
+    Send email task
+    """
+    try:
+        # Simulate email sending
+        import time
+        time.sleep(2)  # Simulate processing time
+        
+        logger.info(f"Email sent to {to_email}: {subject}")
+        
+        return {
+            "status": "sent",
+            "to_email": to_email,
+            "subject": subject,
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to send email to {to_email}: {e}")
+        raise
+
+
+@task_wrapper("app.core.background_tasks.process_file")
+def process_file(
+    file_path: str,
+    processing_type: str,
+    options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Process file task
+    """
+    try:
+        # Simulate file processing
+        import time
+        time.sleep(5)  # Simulate processing time
+        
+        logger.info(f"File processed: {file_path} ({processing_type})")
+        
+        return {
+            "status": "processed",
+            "file_path": file_path,
+            "processing_type": processing_type,
+            "options": options,
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to process file {file_path}: {e}")
+        raise
+
+
+@task_wrapper("app.core.background_tasks.generate_report")
+def generate_report(
+    report_type: str,
+    parameters: Dict[str, Any],
+    user_id: str,
+    format: str = "pdf",
+) -> Dict[str, Any]:
+    """
+    Generate report task
+    """
+    try:
+        # Simulate report generation
+        import time
+        time.sleep(10)  # Simulate processing time
+        
+        report_id = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        logger.info(f"Report generated: {report_id} ({report_type})")
+        
+        return {
+            "status": "generated",
+            "report_id": report_id,
+            "report_type": report_type,
+            "format": format,
+            "user_id": user_id,
+            "parameters": parameters,
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to generate report {report_type}: {e}")
+        raise
+
+
+@task_wrapper("app.core.background_tasks.cleanup_task")
+def cleanup_task(
+    cleanup_type: str,
+    older_than_days: int = 30,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Cleanup task
+    """
+    try:
+        # Simulate cleanup
+        import time
+        time.sleep(3)  # Simulate processing time
+        
+        cleaned_items = 0
+        
+        if cleanup_type == "logs":
+            cleaned_items = 15
+        elif cleanup_type == "temp_files":
+            cleaned_items = 32
+        elif cleanup_type == "sessions":
+            cleaned_items = 8
+        
+        logger.info(f"Cleanup completed: {cleanup_type} ({cleaned_items} items)")
+        
+        return {
+            "status": "completed",
+            "cleanup_type": cleanup_type,
+            "older_than_days": older_than_days,
+            "dry_run": dry_run,
+            "cleaned_items": cleaned_items,
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to cleanup {cleanup_type}: {e}")
+        raise
+
+
+@task_wrapper("app.core.background_tasks.sync_external_data")
+def sync_external_data(
+    source: str,
+    sync_type: str,
+    last_sync: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Sync external data task
+    """
+    try:
+        # Simulate data sync
+        import time
+        time.sleep(8)  # Simulate processing time
+        
+        synced_records = 0
+        
+        if source == "api":
+            synced_records = 120
+        elif source == "database":
+            synced_records = 45
+        elif source == "file":
+            synced_records = 78
+        
+        logger.info(f"Data sync completed: {source} ({synced_records} records)")
+        
+        return {
+            "status": "completed",
+            "source": source,
+            "sync_type": sync_type,
+            "last_sync": last_sync,
+            "synced_records": synced_records,
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to sync data from {source}: {e}")
+        raise
+
+
+# Periodic tasks
+@celery_app.task(name="app.core.background_tasks.daily_cleanup")
+def daily_cleanup():
+    """
+    Daily cleanup task
+    """
+    try:
+        # Run various cleanup tasks
+        cleanup_results = []
+        
+        # Cleanup logs
+        result = cleanup_task.delay("logs", older_than_days=7)
+        cleanup_results.append({"type": "logs", "task_id": result.id})
+        
+        # Cleanup temp files
+        result = cleanup_task.delay("temp_files", older_than_days=1)
+        cleanup_results.append({"type": "temp_files", "task_id": result.id})
+        
+        # Cleanup sessions
+        result = cleanup_task.delay("sessions", older_than_days=30)
+        cleanup_results.append({"type": "sessions", "task_id": result.id})
+        
+        logger.info(f"Daily cleanup initiated: {len(cleanup_results)} tasks")
+        
+        return {
+            "status": "initiated",
+            "cleanup_tasks": cleanup_results,
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to run daily cleanup: {e}")
+        raise
+
+
+# Setup periodic tasks
+def setup_periodic_tasks():
+    """
+    Setup periodic tasks
+    """
+    from celery.schedules import crontab
+    
+    celery_app.conf.beat_schedule = {
+        "daily-cleanup": {
+            "task": "app.core.background_tasks.daily_cleanup",
+            "schedule": crontab(hour=2, minute=0),  # Run at 2 AM daily
+        },
+        "sync-external-data": {
+            "task": "app.core.background_tasks.sync_external_data",
+            "schedule": crontab(minute=0),  # Run every hour
+            "args": ("api", "incremental"),
+        },
+    }
+    
+    logger.info("Periodic tasks configured")
+
+
+def setup_background_tasks():
+    """
+    Setup background tasks
+    """
+    try:
+        # Setup periodic tasks
+        setup_periodic_tasks()
+        
+        logger.info("Background tasks setup completed")
+        
+    except Exception as e:
+        logger.error(f"Failed to setup background tasks: {e}")
+        raise
+
+
+# Utility functions
 def submit_email_task(
     to_email: str,
     subject: str,
     body: str,
     **kwargs
 ) -> str:
-    """Submit an email task."""
-    return background_task_manager.submit_task(
-        "app.worker.tasks.send_email",
+    """
+    Submit email task
+    """
+    return task_manager.submit_task(
+        "app.core.background_tasks.send_email",
         to_email,
         subject,
         body,
-        queue="email",
         **kwargs
     )
 
 
-def submit_data_processing_task(
-    data: Dict[str, Any],
+def submit_file_processing_task(
+    file_path: str,
     processing_type: str,
-    **kwargs
+    options: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Submit a data processing task."""
-    return background_task_manager.submit_task(
-        "app.worker.tasks.process_data",
-        data,
+    """
+    Submit file processing task
+    """
+    return task_manager.submit_task(
+        "app.core.background_tasks.process_file",
+        file_path,
         processing_type,
-        queue="data_processing",
-        **kwargs
+        options
     )
 
 
 def submit_report_generation_task(
     report_type: str,
     parameters: Dict[str, Any],
-    **kwargs
+    user_id: str,
+    format: str = "pdf",
 ) -> str:
-    """Submit a report generation task."""
-    return background_task_manager.submit_task(
-        "app.worker.tasks.generate_report",
+    """
+    Submit report generation task
+    """
+    return task_manager.submit_task(
+        "app.core.background_tasks.generate_report",
         report_type,
         parameters,
-        queue="reports",
-        **kwargs
-    )
-
-
-def submit_user_notification_task(
-    user_id: str,
-    notification_type: str,
-    data: Dict[str, Any],
-    **kwargs
-) -> str:
-    """Submit a user notification task."""
-    return background_task_manager.submit_task(
-        "app.worker.tasks.send_user_notification",
         user_id,
-        notification_type,
-        data,
-        queue="notifications",
-        **kwargs
+        format
     )
 
 
-def submit_batch_processing_task(
-    items: list,
-    batch_size: int = 100,
-    **kwargs
-) -> str:
-    """Submit a batch processing task."""
-    return background_task_manager.submit_task(
-        "app.worker.tasks.process_batch",
-        items,
-        batch_size,
-        queue="batch_processing",
-        **kwargs
-    )
-
-
-def get_task_status(task_id: str) -> Dict[str, Any]:
-    """Get task status."""
-    return background_task_manager.get_task_status(task_id)
+def get_task_result(task_id: str) -> Dict[str, Any]:
+    """
+    Get task result
+    """
+    return task_manager.get_task_status(task_id)
 
 
 def cancel_task(task_id: str) -> bool:
-    """Cancel a task."""
-    return background_task_manager.cancel_task(task_id)
+    """
+    Cancel task
+    """
+    return task_manager.cancel_task(task_id)

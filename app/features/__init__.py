@@ -1,3 +1,3 @@
 """
-Feature modules for the application
+Feature modules package
 """
