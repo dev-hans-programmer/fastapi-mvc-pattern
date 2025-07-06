@@ -1,359 +1,251 @@
 """
-Product services
+Products services.
 """
+from typing import List, Optional, Tuple, Dict, Any
 import logging
-from typing import Optional, List, Dict, Any
 from datetime import datetime
 
-from app.core.exceptions import NotFoundError, ValidationError, BusinessLogicError
 from app.features.products.repositories import ProductRepository
-from app.features.products.types import Product, ProductCreate, ProductUpdate
-from app.common.base_service import BaseService
-from app.common.validators import BaseValidator
+from app.features.products.types import ProductCreate, ProductUpdate, ProductStatsResponse
+from app.models.product import Product
+from app.core.exceptions import NotFoundException, ConflictException
+from app.core.thread_pool import AsyncBatchProcessor
+from app.tasks.product_tasks import update_product_search_index, notify_product_update
 
 logger = logging.getLogger(__name__)
 
 
-class ProductService(BaseService[Product, ProductCreate, ProductUpdate]):
-    """Product service"""
+class ProductService:
+    """Product service."""
     
     def __init__(self, product_repository: ProductRepository):
-        super().__init__(product_repository)
         self.product_repository = product_repository
     
-    async def _validate_create(self, obj_in: ProductCreate) -> None:
-        """Validate product creation"""
-        # Check if SKU already exists
-        if obj_in.sku:
-            existing_product = await self.product_repository.get_by_field("sku", obj_in.sku)
+    async def create_product(self, product_data: ProductCreate) -> Product:
+        """Create a new product."""
+        try:
+            # Check if product with same name already exists
+            existing_product = await self.product_repository.get_by_name(product_data.name)
             if existing_product:
-                raise ValidationError("SKU already exists")
+                raise ConflictException("Product with this name already exists")
+            
+            # Create product
+            product_dict = product_data.dict()
+            product = await self.product_repository.create(product_dict)
+            
+            # Update search index (background task)
+            update_product_search_index.delay(product.id)
+            
+            logger.info(f"Product created: {product.name}")
+            return product
         
-        # Validate price
-        if obj_in.price <= 0:
-            raise ValidationError("Price must be greater than 0")
-        
-        # Validate stock quantity
-        if obj_in.stock_quantity < 0:
-            raise ValidationError("Stock quantity cannot be negative")
-    
-    async def _validate_update(self, db_obj: Product, obj_in: ProductUpdate) -> None:
-        """Validate product update"""
-        # Check if SKU is being changed and if it already exists
-        if obj_in.sku and obj_in.sku != db_obj.sku:
-            existing_product = await self.product_repository.get_by_field("sku", obj_in.sku)
-            if existing_product:
-                raise ValidationError("SKU already exists")
-        
-        # Validate price
-        if obj_in.price is not None and obj_in.price <= 0:
-            raise ValidationError("Price must be greater than 0")
-        
-        # Validate stock quantity
-        if obj_in.stock_quantity is not None and obj_in.stock_quantity < 0:
-            raise ValidationError("Stock quantity cannot be negative")
-    
-    async def _pre_create(self, obj_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Pre-create processing"""
-        # Set default values
-        obj_data.setdefault("is_available", True)
-        obj_data.setdefault("is_featured", False)
-        
-        # Generate SKU if not provided
-        if not obj_data.get("sku"):
-            obj_data["sku"] = await self._generate_sku(obj_data.get("name", ""))
-        
-        return obj_data
-    
-    async def _generate_sku(self, product_name: str) -> str:
-        """Generate SKU for product"""
-        import re
-        import secrets
-        
-        # Clean product name and take first 3 words
-        clean_name = re.sub(r'[^a-zA-Z0-9\s]', '', product_name).upper()
-        words = clean_name.split()[:3]
-        name_part = ''.join(word[:3] for word in words)
-        
-        # Add random suffix
-        random_part = secrets.token_hex(3).upper()
-        
-        return f"{name_part}-{random_part}"
-    
-    async def get_by_sku(self, sku: str) -> Optional[Product]:
-        """Get product by SKU"""
-        try:
-            return await self.product_repository.get_by_field("sku", sku)
         except Exception as e:
-            logger.error(f"Error getting product by SKU: {e}")
+            logger.error(f"Error in create_product: {str(e)}")
             raise
     
-    async def get_products_by_category(self, category: str) -> List[Product]:
-        """Get products by category"""
+    async def get_product_by_id(self, product_id: int) -> Optional[Product]:
+        """Get product by ID."""
         try:
-            return await self.product_repository.get_all(
-                filters={"category": category, "is_available": True}
-            )
+            return await self.product_repository.get_by_id(product_id)
         except Exception as e:
-            logger.error(f"Error getting products by category: {e}")
+            logger.error(f"Error in get_product_by_id: {str(e)}")
             raise
     
-    async def get_featured_products(self, limit: int = 10) -> List[Product]:
-        """Get featured products"""
+    async def get_product_by_name(self, name: str) -> Optional[Product]:
+        """Get product by name."""
         try:
-            return await self.product_repository.get_all(
-                filters={"is_featured": True, "is_available": True},
-                limit=limit,
-                order_by="created_at",
-                order_desc=True
-            )
+            return await self.product_repository.get_by_name(name)
         except Exception as e:
-            logger.error(f"Error getting featured products: {e}")
+            logger.error(f"Error in get_product_by_name: {str(e)}")
             raise
     
-    async def get_low_stock_products(self, threshold: int = 10) -> List[Product]:
-        """Get products with low stock"""
-        try:
-            return await self.product_repository.get_low_stock_products(threshold)
-        except Exception as e:
-            logger.error(f"Error getting low stock products: {e}")
-            raise
-    
-    async def update_stock(self, product_id: int, quantity: int) -> Product:
-        """Update product stock"""
-        try:
-            product = await self.get_by_id_or_raise(product_id)
-            
-            if quantity < 0:
-                raise ValidationError("Stock quantity cannot be negative")
-            
-            updated_product = await self.update(product_id, {"stock_quantity": quantity})
-            
-            logger.info(f"Stock updated for product {product_id}: {quantity}")
-            return updated_product
-            
-        except Exception as e:
-            logger.error(f"Error updating product stock: {e}")
-            raise
-    
-    async def adjust_stock(self, product_id: int, adjustment: int) -> Product:
-        """Adjust product stock by a delta amount"""
-        try:
-            product = await self.get_by_id_or_raise(product_id)
-            
-            new_quantity = product.stock_quantity + adjustment
-            
-            if new_quantity < 0:
-                raise BusinessLogicError("Insufficient stock")
-            
-            updated_product = await self.update(product_id, {"stock_quantity": new_quantity})
-            
-            logger.info(f"Stock adjusted for product {product_id}: {adjustment} (new total: {new_quantity})")
-            return updated_product
-            
-        except Exception as e:
-            logger.error(f"Error adjusting product stock: {e}")
-            raise
-    
-    async def toggle_availability(self, product_id: int) -> Product:
-        """Toggle product availability"""
-        try:
-            product = await self.get_by_id_or_raise(product_id)
-            
-            new_availability = not product.is_available
-            updated_product = await self.update(product_id, {"is_available": new_availability})
-            
-            logger.info(f"Product {product_id} availability toggled to {new_availability}")
-            return updated_product
-            
-        except Exception as e:
-            logger.error(f"Error toggling product availability: {e}")
-            raise
-    
-    async def set_featured(self, product_id: int, is_featured: bool) -> Product:
-        """Set product featured status"""
-        try:
-            product = await self.get_by_id_or_raise(product_id)
-            
-            if product.is_featured == is_featured:
-                raise BusinessLogicError(f"Product is already {'featured' if is_featured else 'not featured'}")
-            
-            updated_product = await self.update(product_id, {"is_featured": is_featured})
-            
-            logger.info(f"Product {product_id} featured status set to {is_featured}")
-            return updated_product
-            
-        except Exception as e:
-            logger.error(f"Error setting product featured status: {e}")
-            raise
-    
-    async def update_price(self, product_id: int, new_price: float) -> Product:
-        """Update product price"""
-        try:
-            product = await self.get_by_id_or_raise(product_id)
-            
-            if new_price <= 0:
-                raise ValidationError("Price must be greater than 0")
-            
-            # Store old price for price history (in a real app)
-            old_price = product.price
-            
-            updated_product = await self.update(product_id, {"price": new_price})
-            
-            logger.info(f"Price updated for product {product_id}: {old_price} -> {new_price}")
-            return updated_product
-            
-        except Exception as e:
-            logger.error(f"Error updating product price: {e}")
-            raise
-    
-    async def get_product_statistics(self) -> Dict[str, Any]:
-        """Get product statistics"""
-        try:
-            total_products = await self.count()
-            available_products = await self.count({"is_available": True})
-            featured_products = await self.count({"is_featured": True})
-            
-            # Get products by category
-            categories = await self.product_repository.get_product_categories()
-            category_counts = {}
-            for category in categories:
-                category_counts[category] = await self.count({"category": category})
-            
-            # Get stock statistics
-            stock_stats = await self.product_repository.get_stock_statistics()
-            
-            stats = {
-                "total_products": total_products,
-                "available_products": available_products,
-                "unavailable_products": total_products - available_products,
-                "featured_products": featured_products,
-                "categories": category_counts,
-                "stock_statistics": stock_stats,
-                "low_stock_count": len(await self.get_low_stock_products()),
-                "out_of_stock_count": await self.count({"stock_quantity": 0})
-            }
-            
-            return stats
-            
-        except Exception as e:
-            logger.error(f"Error getting product statistics: {e}")
-            raise
-    
-    async def search_products_advanced(
+    async def get_products(
         self,
-        search_term: str = None,
-        category: str = None,
-        min_price: float = None,
-        max_price: float = None,
-        in_stock: bool = None,
-        is_featured: bool = None,
         skip: int = 0,
-        limit: int = 100
-    ) -> List[Product]:
-        """Advanced product search"""
+        limit: int = 100,
+        search: Optional[str] = None,
+        category: Optional[str] = None,
+        min_price: Optional[float] = None,
+        max_price: Optional[float] = None,
+        is_active: Optional[bool] = None,
+    ) -> Tuple[List[Product], int]:
+        """Get list of products with pagination and filtering."""
         try:
-            return await self.product_repository.search_products_advanced(
-                search_term=search_term,
+            return await self.product_repository.get_multi(
+                skip=skip,
+                limit=limit,
+                search=search,
                 category=category,
                 min_price=min_price,
                 max_price=max_price,
-                in_stock=in_stock,
-                is_featured=is_featured,
-                skip=skip,
-                limit=limit
+                is_active=is_active,
             )
         except Exception as e:
-            logger.error(f"Error in advanced product search: {e}")
+            logger.error(f"Error in get_products: {str(e)}")
             raise
     
-    async def get_related_products(self, product_id: int, limit: int = 5) -> List[Product]:
-        """Get related products"""
+    async def update_product(self, product_id: int, product_data: ProductUpdate) -> Optional[Product]:
+        """Update product."""
         try:
-            product = await self.get_by_id_or_raise(product_id)
+            # Get existing product
+            existing_product = await self.product_repository.get_by_id(product_id)
+            if not existing_product:
+                raise NotFoundException(f"Product with ID {product_id} not found")
             
-            # Get products in the same category
-            related_products = await self.product_repository.get_all(
-                filters={
-                    "category": product.category,
-                    "is_available": True
-                },
-                limit=limit + 1,  # +1 to exclude the current product
-                order_by="created_at",
-                order_desc=True
-            )
+            # Check name uniqueness if name is being updated
+            if product_data.name and product_data.name != existing_product.name:
+                name_product = await self.product_repository.get_by_name(product_data.name)
+                if name_product:
+                    raise ConflictException("Product with this name already exists")
             
-            # Remove the current product from the list
-            related_products = [p for p in related_products if p.id != product_id][:limit]
+            # Update product
+            update_data = product_data.dict(exclude_unset=True)
+            product = await self.product_repository.update(product_id, update_data)
             
-            return related_products
+            # Notify about update (background task)
+            if product:
+                notify_product_update.delay(product.id, product.name)
             
+            logger.info(f"Product updated: {product.name if product else product_id}")
+            return product
+        
         except Exception as e:
-            logger.error(f"Error getting related products: {e}")
+            logger.error(f"Error in update_product: {str(e)}")
             raise
     
-    async def bulk_update_prices(self, price_updates: List[Dict[str, Any]]) -> int:
-        """Bulk update product prices"""
+    async def delete_product(self, product_id: int) -> bool:
+        """Delete product."""
         try:
-            valid_updates = []
+            # Check if product exists
+            existing_product = await self.product_repository.get_by_id(product_id)
+            if not existing_product:
+                raise NotFoundException(f"Product with ID {product_id} not found")
             
-            for update in price_updates:
-                if "id" not in update or "price" not in update:
-                    continue
+            # Soft delete (deactivate) instead of hard delete
+            result = await self.product_repository.update(product_id, {"is_active": False})
+            
+            logger.info(f"Product deactivated: {product_id}")
+            return result is not None
+        
+        except Exception as e:
+            logger.error(f"Error in delete_product: {str(e)}")
+            raise
+    
+    async def search_products(self, query: str, limit: int = 10) -> List[Product]:
+        """Search products."""
+        try:
+            return await self.product_repository.search_products(query, limit)
+        except Exception as e:
+            logger.error(f"Error in search_products: {str(e)}")
+            raise
+    
+    async def get_product_categories(self) -> List[str]:
+        """Get all product categories."""
+        try:
+            return await self.product_repository.get_categories()
+        except Exception as e:
+            logger.error(f"Error in get_product_categories: {str(e)}")
+            raise
+    
+    def calculate_product_stats(self, product_id: int) -> Optional[ProductStatsResponse]:
+        """Calculate product statistics (CPU-intensive operation)."""
+        try:
+            # This is a CPU-intensive operation that should run in thread pool
+            product = self.product_repository.get_by_id_sync(product_id)
+            if not product:
+                return None
+            
+            # Simulate heavy computation
+            import time
+            time.sleep(0.1)  # Simulate processing time
+            
+            stats_data = self.product_repository.calculate_product_stats_sync(product_id)
+            
+            return ProductStatsResponse(
+                product_id=product_id,
+                total_orders=stats_data.get("total_orders", 0),
+                total_revenue=stats_data.get("total_revenue", 0.0),
+                average_rating=stats_data.get("average_rating", 0.0),
+                view_count=stats_data.get("view_count", 0),
+                inventory_level=stats_data.get("inventory_level", 0),
+                last_order_date=stats_data.get("last_order_date"),
+            )
+        
+        except Exception as e:
+            logger.error(f"Error in calculate_product_stats: {str(e)}")
+            raise
+    
+    async def update_product_inventory(self, product_id: int, quantity: int) -> bool:
+        """Update product inventory."""
+        try:
+            # Check if product exists
+            existing_product = await self.product_repository.get_by_id(product_id)
+            if not existing_product:
+                raise NotFoundException(f"Product with ID {product_id} not found")
+            
+            # Update inventory
+            result = await self.product_repository.update_inventory(product_id, quantity)
+            
+            logger.info(f"Product inventory updated: {product_id}, quantity: {quantity}")
+            return result
+        
+        except Exception as e:
+            logger.error(f"Error in update_product_inventory: {str(e)}")
+            raise
+    
+    async def bulk_update_products(self, product_updates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Bulk update products."""
+        try:
+            results = []
+            
+            # Use batch processor for concurrent updates
+            async with AsyncBatchProcessor(batch_size=10) as processor:
                 
-                if update["price"] <= 0:
-                    continue
+                async def process_product_update(update_data: Dict[str, Any]) -> Dict[str, Any]:
+                    try:
+                        product_id = update_data.get("id")
+                        if not product_id:
+                            return {"id": None, "status": "error", "message": "Missing product ID"}
+                        
+                        # Remove id from update data
+                        update_fields = {k: v for k, v in update_data.items() if k != "id"}
+                        
+                        # Update product
+                        product = await self.product_repository.update(product_id, update_fields)
+                        
+                        if product:
+                            return {"id": product_id, "status": "success", "message": "Product updated"}
+                        else:
+                            return {"id": product_id, "status": "error", "message": "Product not found"}
+                    
+                    except Exception as e:
+                        return {"id": product_id, "status": "error", "message": str(e)}
                 
-                valid_updates.append(update)
+                # Process all updates
+                results = await processor.process_batch(
+                    product_updates,
+                    process_product_update
+                )
             
-            updated_count = await self.product_repository.bulk_update(valid_updates)
-            
-            logger.info(f"Bulk price update completed: {updated_count} products updated")
-            return updated_count
-            
+            logger.info(f"Bulk update completed: {len(results)} products processed")
+            return results
+        
         except Exception as e:
-            logger.error(f"Error in bulk price update: {e}")
+            logger.error(f"Error in bulk_update_products: {str(e)}")
             raise
     
-    async def get_products_by_price_range(
-        self,
-        min_price: float,
-        max_price: float,
-        limit: int = 100
-    ) -> List[Product]:
-        """Get products within a price range"""
+    async def get_featured_products(self, limit: int = 10) -> List[Product]:
+        """Get featured products."""
         try:
-            return await self.product_repository.get_products_by_price_range(
-                min_price, max_price, limit
-            )
+            return await self.product_repository.get_featured_products(limit)
         except Exception as e:
-            logger.error(f"Error getting products by price range: {e}")
+            logger.error(f"Error in get_featured_products: {str(e)}")
             raise
     
-    async def export_products(self, format: str = "csv") -> Dict[str, Any]:
-        """Export products"""
+    async def get_low_stock_products(self, threshold: int = 10) -> List[Product]:
+        """Get products with low stock."""
         try:
-            products = await self.get_all()
-            
-            if format.lower() == "csv":
-                export_data = {
-                    "format": "csv",
-                    "filename": f"products_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv",
-                    "record_count": len(products),
-                    "download_url": "/api/v1/products/export/download/csv"
-                }
-            elif format.lower() == "json":
-                export_data = {
-                    "format": "json",
-                    "filename": f"products_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json",
-                    "record_count": len(products),
-                    "download_url": "/api/v1/products/export/download/json"
-                }
-            else:
-                raise ValidationError("Invalid export format. Supported formats: csv, json")
-            
-            return export_data
-            
+            return await self.product_repository.get_low_stock_products(threshold)
         except Exception as e:
-            logger.error(f"Error exporting products: {e}")
+            logger.error(f"Error in get_low_stock_products: {str(e)}")
             raise

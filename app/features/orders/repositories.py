@@ -1,336 +1,278 @@
 """
-Order repositories
+Orders repositories.
 """
+from typing import List, Optional, Tuple, Dict, Any
+from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_, func, desc
+from datetime import datetime
 import logging
-from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
-from sqlalchemy import select, update, func, and_, or_
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
-from app.common.base_repository import BaseRepository
-from app.features.orders.types import Order, OrderItem
+from app.models.order import Order, OrderItem
+from app.core.exceptions import NotFoundException
 
 logger = logging.getLogger(__name__)
 
 
-class OrderRepository(BaseRepository[Order]):
-    """Order repository"""
+class OrderRepository:
+    """Order repository."""
     
-    def __init__(self, session: AsyncSession):
-        super().__init__(session, Order)
+    def __init__(self, db: Session):
+        self.db = db
     
-    async def get_order_with_items(self, order_id: int) -> Optional[Order]:
-        """Get order with its items"""
+    async def create(self, order_data: dict, order_items: List[dict]) -> Order:
+        """Create a new order with items."""
         try:
-            stmt = select(self.model).options(
-                selectinload(self.model.items)
-            ).where(self.model.id == order_id)
+            order = Order(**order_data)
+            self.db.add(order)
+            self.db.flush()  # Get the order ID
             
-            result = await self.session.execute(stmt)
-            return result.scalar_one_or_none()
+            # Create order items
+            for item_data in order_items:
+                item_data["order_id"] = order.id
+                order_item = OrderItem(**item_data)
+                self.db.add(order_item)
             
+            self.db.commit()
+            self.db.refresh(order)
+            return order
         except Exception as e:
-            logger.error(f"Error getting order with items: {e}")
+            logger.error(f"Error creating order: {str(e)}")
+            self.db.rollback()
             raise
     
-    async def get_user_orders(self, user_id: int) -> List[Order]:
-        """Get all orders for a user"""
+    async def get_by_id(self, order_id: int) -> Optional[Order]:
+        """Get order by ID."""
         try:
-            return await self.get_all(
-                filters={"user_id": user_id},
-                order_by="created_at",
-                order_desc=True
-            )
+            return self.db.query(Order).filter(Order.id == order_id).first()
         except Exception as e:
-            logger.error(f"Error getting user orders: {e}")
+            logger.error(f"Error getting order by ID: {str(e)}")
             raise
     
-    async def get_orders_by_status(self, status: str) -> List[Order]:
-        """Get orders by status"""
+    def get_by_id_sync(self, order_id: int) -> Optional[Order]:
+        """Get order by ID (synchronous version for thread pool)."""
         try:
-            return await self.get_all(filters={"status": status})
+            return self.db.query(Order).filter(Order.id == order_id).first()
         except Exception as e:
-            logger.error(f"Error getting orders by status: {e}")
+            logger.error(f"Error getting order by ID (sync): {str(e)}")
             raise
     
-    async def get_orders_by_status_count(self) -> Dict[str, int]:
-        """Get count of orders by status"""
-        try:
-            stmt = select(
-                self.model.status,
-                func.count(self.model.id).label('count')
-            ).group_by(self.model.status)
-            
-            result = await self.session.execute(stmt)
-            return {row.status: row.count for row in result.fetchall()}
-            
-        except Exception as e:
-            logger.error(f"Error getting orders by status count: {e}")
-            raise
-    
-    async def get_orders_since_date(self, since_date: datetime) -> List[Order]:
-        """Get orders since a specific date"""
-        try:
-            stmt = select(self.model).where(
-                self.model.created_at >= since_date
-            ).order_by(self.model.created_at.desc())
-            
-            result = await self.session.execute(stmt)
-            return result.scalars().all()
-            
-        except Exception as e:
-            logger.error(f"Error getting orders since date: {e}")
-            raise
-    
-    async def get_user_orders_since_date(self, user_id: int, since_date: datetime) -> List[Order]:
-        """Get user orders since a specific date"""
-        try:
-            stmt = select(self.model).where(
-                and_(
-                    self.model.user_id == user_id,
-                    self.model.created_at >= since_date
-                )
-            ).order_by(self.model.created_at.desc())
-            
-            result = await self.session.execute(stmt)
-            return result.scalars().all()
-            
-        except Exception as e:
-            logger.error(f"Error getting user orders since date: {e}")
-            raise
-    
-    async def get_revenue_statistics(self) -> Dict[str, Any]:
-        """Get revenue statistics"""
-        try:
-            # Total revenue
-            total_revenue_result = await self.session.execute(
-                select(func.sum(self.model.total_amount)).where(
-                    self.model.status.in_(['delivered', 'shipped'])
-                )
-            )
-            total_revenue = total_revenue_result.scalar() or 0
-            
-            # Average order value
-            avg_order_result = await self.session.execute(
-                select(func.avg(self.model.total_amount)).where(
-                    self.model.status.in_(['delivered', 'shipped'])
-                )
-            )
-            avg_order_value = avg_order_result.scalar() or 0
-            
-            # Monthly revenue (last 12 months)
-            twelve_months_ago = datetime.utcnow() - timedelta(days=365)
-            monthly_revenue_result = await self.session.execute(
-                select(
-                    func.date_trunc('month', self.model.created_at).label('month'),
-                    func.sum(self.model.total_amount).label('revenue')
-                ).where(
-                    and_(
-                        self.model.created_at >= twelve_months_ago,
-                        self.model.status.in_(['delivered', 'shipped'])
-                    )
-                ).group_by(func.date_trunc('month', self.model.created_at))
-                .order_by(func.date_trunc('month', self.model.created_at))
-            )
-            
-            monthly_revenue = {
-                row.month.strftime('%Y-%m'): float(row.revenue)
-                for row in monthly_revenue_result.fetchall()
-            }
-            
-            return {
-                "total_revenue": float(total_revenue),
-                "average_order_value": float(avg_order_value),
-                "monthly_revenue": monthly_revenue
-            }
-            
-        except Exception as e:
-            logger.error(f"Error getting revenue statistics: {e}")
-            raise
-    
-    async def search_orders(
+    async def get_multi(
         self,
-        search_term: str,
-        user_id: int = None,
+        user_id: Optional[int] = None,
         skip: int = 0,
-        limit: int = 100
-    ) -> List[Order]:
-        """Search orders by order number or customer info"""
+        limit: int = 100,
+        status_filter: Optional[str] = None,
+    ) -> Tuple[List[Order], int]:
+        """Get multiple orders with pagination and filtering."""
         try:
-            stmt = select(self.model).where(
-                or_(
-                    self.model.order_number.ilike(f"%{search_term}%"),
-                    self.model.shipping_address['name'].astext.ilike(f"%{search_term}%"),
-                    self.model.billing_address['name'].astext.ilike(f"%{search_term}%")
-                )
-            )
+            query = self.db.query(Order)
             
+            # Apply filters
             if user_id:
-                stmt = stmt.where(self.model.user_id == user_id)
+                query = query.filter(Order.user_id == user_id)
             
-            stmt = stmt.offset(skip).limit(limit)
+            if status_filter:
+                query = query.filter(Order.status == status_filter)
             
-            result = await self.session.execute(stmt)
-            return result.scalars().all()
+            # Get total count
+            total = query.count()
             
+            # Apply pagination and ordering
+            orders = query.order_by(desc(Order.created_at)).offset(skip).limit(limit).all()
+            
+            return orders, total
+        
         except Exception as e:
-            logger.error(f"Error searching orders: {e}")
+            logger.error(f"Error getting multiple orders: {str(e)}")
+            raise
+    
+    async def update(self, order_id: int, update_data: dict) -> Optional[Order]:
+        """Update order."""
+        try:
+            order = self.db.query(Order).filter(Order.id == order_id).first()
+            if not order:
+                return None
+            
+            # Update fields
+            for field, value in update_data.items():
+                if hasattr(order, field):
+                    setattr(order, field, value)
+            
+            order.updated_at = datetime.utcnow()
+            self.db.commit()
+            self.db.refresh(order)
+            
+            return order
+        
+        except Exception as e:
+            logger.error(f"Error updating order: {str(e)}")
+            self.db.rollback()
+            raise
+    
+    async def delete(self, order_id: int) -> bool:
+        """Delete order."""
+        try:
+            order = self.db.query(Order).filter(Order.id == order_id).first()
+            if not order:
+                return False
+            
+            # Delete order items first
+            self.db.query(OrderItem).filter(OrderItem.order_id == order_id).delete()
+            
+            # Delete order
+            self.db.delete(order)
+            self.db.commit()
+            return True
+        
+        except Exception as e:
+            logger.error(f"Error deleting order: {str(e)}")
+            self.db.rollback()
+            raise
+    
+    async def get_user_orders(self, user_id: int, skip: int = 0, limit: int = 100) -> Tuple[List[Order], int]:
+        """Get orders for a specific user."""
+        try:
+            query = self.db.query(Order).filter(Order.user_id == user_id)
+            
+            total = query.count()
+            orders = query.order_by(desc(Order.created_at)).offset(skip).limit(limit).all()
+            
+            return orders, total
+        
+        except Exception as e:
+            logger.error(f"Error getting user orders: {str(e)}")
             raise
     
     async def get_order_items(self, order_id: int) -> List[OrderItem]:
-        """Get items for an order"""
+        """Get order items."""
         try:
-            stmt = select(OrderItem).where(OrderItem.order_id == order_id)
-            result = await self.session.execute(stmt)
-            return result.scalars().all()
-            
+            return self.db.query(OrderItem).filter(OrderItem.order_id == order_id).all()
         except Exception as e:
-            logger.error(f"Error getting order items: {e}")
+            logger.error(f"Error getting order items: {str(e)}")
             raise
     
-    async def create_order_item(self, order_id: int, item_data: Dict[str, Any]) -> OrderItem:
-        """Create an order item"""
+    async def get_orders_by_status(self, status: str, limit: int = 100) -> List[Order]:
+        """Get orders by status."""
         try:
-            item_data["order_id"] = order_id
-            
-            # Get product to set price at time of order
-            from app.features.products.types import Product
-            product_result = await self.session.execute(
-                select(Product).where(Product.id == item_data["product_id"])
+            return (
+                self.db.query(Order)
+                .filter(Order.status == status)
+                .order_by(desc(Order.created_at))
+                .limit(limit)
+                .all()
             )
-            product = product_result.scalar_one_or_none()
-            
-            if product:
-                item_data["unit_price"] = float(product.price)
-                item_data["total_price"] = float(product.price) * item_data["quantity"]
-            
-            order_item = OrderItem(**item_data)
-            self.session.add(order_item)
-            await self.session.commit()
-            await self.session.refresh(order_item)
-            
-            return order_item
-            
         except Exception as e:
-            await self.session.rollback()
-            logger.error(f"Error creating order item: {e}")
-            raise
-    
-    async def update_order_item(self, item_id: int, update_data: Dict[str, Any]) -> OrderItem:
-        """Update an order item"""
-        try:
-            stmt = select(OrderItem).where(OrderItem.id == item_id)
-            result = await self.session.execute(stmt)
-            order_item = result.scalar_one_or_none()
-            
-            if not order_item:
-                raise ValueError(f"Order item with id {item_id} not found")
-            
-            for key, value in update_data.items():
-                if hasattr(order_item, key):
-                    setattr(order_item, key, value)
-            
-            # Recalculate total price if quantity or unit price changed
-            if 'quantity' in update_data or 'unit_price' in update_data:
-                order_item.total_price = order_item.unit_price * order_item.quantity
-            
-            await self.session.commit()
-            await self.session.refresh(order_item)
-            
-            return order_item
-            
-        except Exception as e:
-            await self.session.rollback()
-            logger.error(f"Error updating order item: {e}")
-            raise
-    
-    async def delete_order_item(self, item_id: int) -> bool:
-        """Delete an order item"""
-        try:
-            stmt = select(OrderItem).where(OrderItem.id == item_id)
-            result = await self.session.execute(stmt)
-            order_item = result.scalar_one_or_none()
-            
-            if not order_item:
-                return False
-            
-            await self.session.delete(order_item)
-            await self.session.commit()
-            
-            return True
-            
-        except Exception as e:
-            await self.session.rollback()
-            logger.error(f"Error deleting order item: {e}")
+            logger.error(f"Error getting orders by status: {str(e)}")
             raise
     
     async def get_orders_by_date_range(
         self,
         start_date: datetime,
-        end_date: datetime,
-        user_id: int = None
+        end_date: datetime
     ) -> List[Order]:
-        """Get orders within a date range"""
+        """Get orders within date range."""
         try:
-            stmt = select(self.model).where(
-                and_(
-                    self.model.created_at >= start_date,
-                    self.model.created_at <= end_date
+            return (
+                self.db.query(Order)
+                .filter(
+                    and_(
+                        Order.created_at >= start_date,
+                        Order.created_at <= end_date,
+                    )
                 )
+                .order_by(desc(Order.created_at))
+                .all()
             )
-            
-            if user_id:
-                stmt = stmt.where(self.model.user_id == user_id)
-            
-            stmt = stmt.order_by(self.model.created_at.desc())
-            
-            result = await self.session.execute(stmt)
-            return result.scalars().all()
-            
         except Exception as e:
-            logger.error(f"Error getting orders by date range: {e}")
+            logger.error(f"Error getting orders by date range: {str(e)}")
             raise
     
-    async def get_top_customers(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get top customers by order value"""
+    def calculate_order_stats_sync(self, order_id: int) -> Dict[str, Any]:
+        """Calculate order statistics (synchronous for thread pool)."""
         try:
-            stmt = select(
-                self.model.user_id,
-                func.count(self.model.id).label('order_count'),
-                func.sum(self.model.total_amount).label('total_spent')
-            ).where(
-                self.model.status.in_(['delivered', 'shipped'])
-            ).group_by(self.model.user_id).order_by(
-                func.sum(self.model.total_amount).desc()
-            ).limit(limit)
+            order = self.db.query(Order).filter(Order.id == order_id).first()
+            if not order:
+                return {}
             
-            result = await self.session.execute(stmt)
-            return [
-                {
-                    "user_id": row.user_id,
-                    "order_count": row.order_count,
-                    "total_spent": float(row.total_spent)
-                }
-                for row in result.fetchall()
-            ]
+            # Get order items
+            items = self.db.query(OrderItem).filter(OrderItem.order_id == order_id).all()
             
+            # Calculate processing time
+            processing_time = 0
+            if order.updated_at and order.created_at:
+                processing_time = (order.updated_at - order.created_at).total_seconds()
+            
+            return {
+                "total_amount": float(order.total_amount),
+                "item_count": len(items),
+                "processing_time": processing_time,
+                "shipping_cost": 0.0,  # Would be calculated based on shipping method
+                "tax_amount": float(order.total_amount) * 0.08,  # 8% tax
+                "discount_amount": 0.0,  # Would be calculated based on discounts
+            }
+        
         except Exception as e:
-            logger.error(f"Error getting top customers: {e}")
+            logger.error(f"Error calculating order stats: {str(e)}")
+            raise
+    
+    async def get_user_order_summary(self, user_id: int) -> Dict[str, Any]:
+        """Get order summary for user."""
+        try:
+            # Get order counts by status
+            status_counts = (
+                self.db.query(Order.status, func.count(Order.id))
+                .filter(Order.user_id == user_id)
+                .group_by(Order.status)
+                .all()
+            )
+            
+            # Get total spent
+            total_spent = (
+                self.db.query(func.sum(Order.total_amount))
+                .filter(Order.user_id == user_id)
+                .scalar() or 0.0
+            )
+            
+            # Get order count
+            total_orders = (
+                self.db.query(func.count(Order.id))
+                .filter(Order.user_id == user_id)
+                .scalar() or 0
+            )
+            
+            return {
+                "total_orders": total_orders,
+                "total_spent": float(total_spent),
+                "status_counts": {status: count for status, count in status_counts},
+                "average_order_value": float(total_spent) / total_orders if total_orders > 0 else 0.0,
+            }
+        
+        except Exception as e:
+            logger.error(f"Error getting user order summary: {str(e)}")
+            raise
+    
+    async def get_recent_orders(self, limit: int = 10) -> List[Order]:
+        """Get recent orders."""
+        try:
+            return (
+                self.db.query(Order)
+                .order_by(desc(Order.created_at))
+                .limit(limit)
+                .all()
+            )
+        except Exception as e:
+            logger.error(f"Error getting recent orders: {str(e)}")
             raise
     
     async def get_pending_orders(self) -> List[Order]:
-        """Get all pending orders"""
+        """Get pending orders."""
         try:
-            return await self.get_orders_by_status("pending")
+            return (
+                self.db.query(Order)
+                .filter(Order.status == "pending")
+                .order_by(Order.created_at)
+                .all()
+            )
         except Exception as e:
-            logger.error(f"Error getting pending orders: {e}")
-            raise
-    
-    async def get_orders_needing_shipment(self) -> List[Order]:
-        """Get orders that need to be shipped"""
-        try:
-            return await self.get_orders_by_status("processing")
-        except Exception as e:
-            logger.error(f"Error getting orders needing shipment: {e}")
+            logger.error(f"Error getting pending orders: {str(e)}")
             raise

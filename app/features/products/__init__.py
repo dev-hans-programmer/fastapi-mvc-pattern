@@ -1,3 +1,3 @@
 """
-Product management feature
+Products feature package.
 """

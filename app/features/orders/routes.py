@@ -1,311 +1,319 @@
 """
 Order routes
 """
-import logging
-from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_session
-from app.core.dependencies import get_current_user, get_current_active_user, get_current_admin_user, CommonQueryParams
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from typing import List, Optional, Dict, Any
+
 from app.features.orders.controllers import OrderController
-from app.features.orders.types import OrderCreate, OrderUpdate, OrderResponse, OrderItemCreate
-from app.features.users.types import User
-from app.common.decorators import rate_limit
-from app.common.responses import success_response
+from app.features.orders.validation import (
+    OrderCreateRequest,
+    OrderUpdateRequest,
+    OrderResponse,
+    OrderListResponse,
+    OrderItemResponse,
+)
+from app.core.dependencies import (
+    get_current_user,
+    get_admin_user,
+    get_pagination_params,
+    get_sorting_params,
+    get_filtering_params,
+)
 
-logger = logging.getLogger(__name__)
-
-orders_router = APIRouter()
+router = APIRouter()
 
 
-@orders_router.post("/", response_model=Dict[str, Any])
+@router.post("/", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
 async def create_order(
-    order_data: OrderCreate,
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
+    request: OrderCreateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    controller: OrderController = Depends(),
 ):
-    """Create a new order"""
-    controller = OrderController(session)
-    return await controller.create_order(order_data, current_user)
+    """
+    Create a new order
+    """
+    try:
+        order = await controller.create_order(request, current_user["id"])
+        return order
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
 
 
-@orders_router.get("/{order_id}", response_model=Dict[str, Any])
+@router.get("/", response_model=OrderListResponse)
+async def list_orders(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    pagination: Dict[str, Any] = Depends(get_pagination_params),
+    sorting: Dict[str, Any] = Depends(get_sorting_params),
+    filters: Dict[str, Any] = Depends(get_filtering_params),
+    controller: OrderController = Depends(),
+):
+    """
+    Get list of orders
+    """
+    try:
+        # Non-admin users can only see their own orders
+        if current_user["role"] != "admin":
+            filters["user_id"] = current_user["id"]
+        
+        orders = await controller.list_orders(
+            skip=pagination["offset"],
+            limit=pagination["limit"],
+            sort_by=sorting["sort_by"],
+            sort_order=sorting["sort_order"],
+            filters=filters,
+        )
+        return orders
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.get("/my-orders", response_model=OrderListResponse)
+async def get_my_orders(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    pagination: Dict[str, Any] = Depends(get_pagination_params),
+    sorting: Dict[str, Any] = Depends(get_sorting_params),
+    controller: OrderController = Depends(),
+):
+    """
+    Get current user's orders
+    """
+    try:
+        orders = await controller.get_user_orders(
+            user_id=current_user["id"],
+            skip=pagination["offset"],
+            limit=pagination["limit"],
+            sort_by=sorting["sort_by"],
+            sort_order=sorting["sort_order"],
+        )
+        return orders
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.get("/{order_id}", response_model=OrderResponse)
 async def get_order(
-    order_id: int,
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
+    order_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    controller: OrderController = Depends(),
 ):
-    """Get order by ID"""
-    controller = OrderController(session)
-    return await controller.get_order(order_id, current_user)
+    """
+    Get order by ID
+    """
+    try:
+        order = await controller.get_order(order_id, current_user["id"], current_user["role"])
+        return order
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
 
 
-@orders_router.get("/", response_model=Dict[str, Any])
-async def get_orders(
-    params: CommonQueryParams = Depends(),
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
-):
-    """Get orders for current user"""
-    controller = OrderController(session)
-    return await controller.get_orders(params, current_user)
-
-
-@orders_router.get("/paginated/list", response_model=Dict[str, Any])
-async def get_orders_paginated(
-    page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(20, ge=1, le=100, description="Page size"),
-    status: Optional[str] = Query(None, description="Filter by order status"),
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
-):
-    """Get orders with pagination"""
-    controller = OrderController(session)
-    return await controller.get_orders_paginated(page, page_size, status, current_user)
-
-
-@orders_router.put("/{order_id}", response_model=Dict[str, Any])
+@router.put("/{order_id}", response_model=OrderResponse)
 async def update_order(
-    order_id: int,
-    order_data: OrderUpdate,
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
+    order_id: str,
+    request: OrderUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    controller: OrderController = Depends(),
 ):
-    """Update order"""
-    controller = OrderController(session)
-    return await controller.update_order(order_id, order_data, current_user)
+    """
+    Update order by ID
+    """
+    try:
+        order = await controller.update_order(order_id, request, current_user["id"], current_user["role"])
+        return order
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
 
 
-@orders_router.patch("/{order_id}/cancel", response_model=Dict[str, Any])
+@router.delete("/{order_id}")
 async def cancel_order(
-    order_id: int,
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
+    order_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    controller: OrderController = Depends(),
 ):
-    """Cancel order"""
-    controller = OrderController(session)
-    return await controller.cancel_order(order_id, current_user)
+    """
+    Cancel order by ID
+    """
+    try:
+        await controller.cancel_order(order_id, current_user["id"], current_user["role"])
+        return {"message": "Order cancelled successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
 
 
-@orders_router.patch("/{order_id}/status", response_model=Dict[str, Any])
-async def update_order_status(
-    order_id: int,
-    status: str = Query(..., description="New order status"),
-    current_user: User = Depends(get_current_admin_user),
-    session: AsyncSession = Depends(get_session)
+@router.post("/{order_id}/confirm")
+async def confirm_order(
+    order_id: str,
+    current_user: Dict[str, Any] = Depends(get_admin_user),
+    controller: OrderController = Depends(),
 ):
-    """Update order status (Admin only)"""
-    controller = OrderController(session)
-    return await controller.update_order_status(order_id, status, current_user)
+    """
+    Confirm order (Admin only)
+    """
+    try:
+        await controller.confirm_order(order_id)
+        return {"message": "Order confirmed successfully"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
 
 
-@orders_router.get("/statistics/overview", response_model=Dict[str, Any])
-async def get_order_statistics(
-    current_user: User = Depends(get_current_admin_user),
-    session: AsyncSession = Depends(get_session)
+@router.post("/{order_id}/ship")
+async def ship_order(
+    order_id: str,
+    tracking_number: Optional[str] = Query(None),
+    current_user: Dict[str, Any] = Depends(get_admin_user),
+    controller: OrderController = Depends(),
 ):
-    """Get order statistics (Admin only)"""
-    controller = OrderController(session)
-    return await controller.get_order_statistics(current_user)
+    """
+    Ship order (Admin only)
+    """
+    try:
+        await controller.ship_order(order_id, tracking_number)
+        return {"message": "Order shipped successfully"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
 
 
-@orders_router.get("/history/my", response_model=Dict[str, Any])
-async def get_my_order_history(
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
+@router.post("/{order_id}/deliver")
+async def deliver_order(
+    order_id: str,
+    current_user: Dict[str, Any] = Depends(get_admin_user),
+    controller: OrderController = Depends(),
 ):
-    """Get current user's order history"""
-    controller = OrderController(session)
-    return await controller.get_user_order_history(current_user)
+    """
+    Mark order as delivered (Admin only)
+    """
+    try:
+        await controller.deliver_order(order_id)
+        return {"message": "Order marked as delivered successfully"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
 
 
-@orders_router.get("/status/{status}", response_model=Dict[str, Any])
-async def get_orders_by_status(
+@router.get("/{order_id}/items", response_model=List[OrderItemResponse])
+async def get_order_items(
+    order_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    controller: OrderController = Depends(),
+):
+    """
+    Get order items
+    """
+    try:
+        items = await controller.get_order_items(order_id, current_user["id"], current_user["role"])
+        return items
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.get("/{order_id}/status-history")
+async def get_order_status_history(
+    order_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    controller: OrderController = Depends(),
+):
+    """
+    Get order status history
+    """
+    try:
+        history = await controller.get_order_status_history(order_id, current_user["id"], current_user["role"])
+        return history
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.get("/{order_id}/stats")
+async def get_order_stats(
+    order_id: str,
+    current_user: Dict[str, Any] = Depends(get_admin_user),
+    controller: OrderController = Depends(),
+):
+    """
+    Get order statistics (Admin only)
+    """
+    try:
+        stats = await controller.get_order_stats(order_id)
+        return stats
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.get("/stats/summary")
+async def get_orders_summary(
+    current_user: Dict[str, Any] = Depends(get_admin_user),
+    controller: OrderController = Depends(),
+):
+    """
+    Get orders summary statistics (Admin only)
+    """
+    try:
+        summary = await controller.get_orders_summary()
+        return summary
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.post("/bulk-update-status")
+async def bulk_update_order_status(
+    order_ids: List[str],
     status: str,
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
+    current_user: Dict[str, Any] = Depends(get_admin_user),
+    controller: OrderController = Depends(),
 ):
-    """Get orders by status"""
-    controller = OrderController(session)
-    return await controller.get_orders_by_status(status, current_user)
+    """
+    Bulk update order status (Admin only)
+    """
+    try:
+        result = await controller.bulk_update_order_status(order_ids, status)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
 
 
-@orders_router.post("/{order_id}/items", response_model=Dict[str, Any])
-async def add_order_item(
-    order_id: int,
-    item_data: OrderItemCreate,
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
-):
-    """Add item to order"""
-    controller = OrderController(session)
-    return await controller.add_order_item(order_id, item_data, current_user)
-
-
-@orders_router.delete("/{order_id}/items/{item_id}", response_model=Dict[str, Any])
-async def remove_order_item(
-    order_id: int,
-    item_id: int,
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
-):
-    """Remove item from order"""
-    controller = OrderController(session)
-    return await controller.remove_order_item(order_id, item_id, current_user)
-
-
-@orders_router.post("/calculate-total", response_model=Dict[str, Any])
-async def calculate_order_total(
-    order_data: OrderCreate,
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
-):
-    """Calculate order total before creating"""
-    controller = OrderController(session)
-    return await controller.calculate_order_total(order_data)
-
-
-@orders_router.get("/recent/list", response_model=Dict[str, Any])
-async def get_recent_orders(
-    days: int = Query(30, ge=1, le=365, description="Number of days"),
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
-):
-    """Get recent orders"""
-    controller = OrderController(session)
-    return await controller.get_recent_orders(days, current_user)
-
-
-@orders_router.get("/admin/all", response_model=Dict[str, Any])
-async def get_all_orders_admin(
-    params: CommonQueryParams = Depends(),
-    current_user: User = Depends(get_current_admin_user),
-    session: AsyncSession = Depends(get_session)
-):
-    """Get all orders (Admin only)"""
-    # Remove user filter for admin
-    from app.features.orders.services import OrderService
-    from app.features.orders.repositories import OrderRepository
-    from app.features.products.repositories import ProductRepository
-    
-    order_repository = OrderRepository(session)
-    product_repository = ProductRepository(session)
-    order_service = OrderService(order_repository, product_repository)
-    
-    orders = await order_service.get_all(
-        skip=params.skip,
-        limit=params.limit,
-        order_by=params.sort_by or "created_at",
-        order_desc=params.sort_order == "desc"
-    )
-    
-    from app.features.orders.types import OrderResponse
-    order_responses = [OrderResponse.from_orm(order).dict() for order in orders]
-    
-    return success_response(
-        data=order_responses,
-        message="All orders retrieved successfully"
-    )
-
-
-@orders_router.get("/admin/pending", response_model=Dict[str, Any])
-async def get_pending_orders_admin(
-    current_user: User = Depends(get_current_admin_user),
-    session: AsyncSession = Depends(get_session)
-):
-    """Get pending orders (Admin only)"""
-    from app.features.orders.repositories import OrderRepository
-    
-    order_repository = OrderRepository(session)
-    orders = await order_repository.get_pending_orders()
-    
-    from app.features.orders.types import OrderResponse
-    order_responses = [OrderResponse.from_orm(order).dict() for order in orders]
-    
-    return success_response(
-        data=order_responses,
-        message="Pending orders retrieved successfully"
-    )
-
-
-@orders_router.get("/admin/needs-shipment", response_model=Dict[str, Any])
-async def get_orders_needing_shipment(
-    current_user: User = Depends(get_current_admin_user),
-    session: AsyncSession = Depends(get_session)
-):
-    """Get orders that need shipment (Admin only)"""
-    from app.features.orders.repositories import OrderRepository
-    
-    order_repository = OrderRepository(session)
-    orders = await order_repository.get_orders_needing_shipment()
-    
-    from app.features.orders.types import OrderResponse
-    order_responses = [OrderResponse.from_orm(order).dict() for order in orders]
-    
-    return success_response(
-        data=order_responses,
-        message="Orders needing shipment retrieved successfully"
-    )
-
-
-@orders_router.get("/search/query", response_model=Dict[str, Any])
-async def search_orders(
-    search_term: str = Query(..., min_length=2, description="Search term"),
-    skip: int = Query(0, ge=0, description="Skip items"),
-    limit: int = Query(20, ge=1, le=100, description="Limit items"),
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_session)
-):
-    """Search orders"""
-    from app.features.orders.repositories import OrderRepository
-    
-    order_repository = OrderRepository(session)
-    
-    # Users can only search their own orders unless they're admin
-    user_id = None if getattr(current_user, 'role', 'user') == 'admin' else current_user.id
-    
-    orders = await order_repository.search_orders(search_term, user_id, skip, limit)
-    
-    from app.features.orders.types import OrderResponse
-    order_responses = [OrderResponse.from_orm(order).dict() for order in orders]
-    
-    return success_response(
-        data=order_responses,
-        message="Order search completed"
-    )
-
-
-@orders_router.get("/analytics/top-customers", response_model=Dict[str, Any])
-async def get_top_customers(
-    limit: int = Query(10, ge=1, le=100, description="Number of top customers"),
-    current_user: User = Depends(get_current_admin_user),
-    session: AsyncSession = Depends(get_session)
-):
-    """Get top customers by order value (Admin only)"""
-    from app.features.orders.repositories import OrderRepository
-    
-    order_repository = OrderRepository(session)
-    top_customers = await order_repository.get_top_customers(limit)
-    
-    return success_response(
-        data=top_customers,
-        message="Top customers retrieved successfully"
-    )
-
-
-@orders_router.get("/analytics/revenue", response_model=Dict[str, Any])
-async def get_revenue_analytics(
-    current_user: User = Depends(get_current_admin_user),
-    session: AsyncSession = Depends(get_session)
-):
-    """Get revenue analytics (Admin only)"""
-    from app.features.orders.repositories import OrderRepository
-    
-    order_repository = OrderRepository(session)
-    revenue_stats = await order_repository.get_revenue_statistics()
-    
-    return success_response(
-        data=revenue_stats,
-        message="Revenue analytics retrieved successfully"
-    )
+# Export router
+orders_router = router

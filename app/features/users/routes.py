@@ -1,189 +1,142 @@
 """
-User routes
+Users routes.
 """
-from typing import List, Dict, Any
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException, status
+from typing import List, Optional, Dict, Any
 
 from app.features.users.controllers import UserController
-from app.features.users.schemas import (
-    UserDetailResponse,
-    UserProfileCreate,
-    UserProfileUpdate,
-    UserProfileResponse,
-    UserPreferencesUpdate,
-    UserPreferencesResponse,
-    UserActivityCreate,
-    UserActivityResponse,
-    UserSessionResponse,
-    UserUpdateAdmin,
-    UserStatsResponse,
-    UserSearchFilters,
-    BulkUserAction
+from app.features.users.services import UserService
+from app.features.users.repositories import UserRepository
+from app.features.users.types import (
+    UserCreate, UserUpdate, UserResponse, UserListResponse,
+    UserProfileResponse, UserStatsResponse
 )
-from app.core.dependencies import get_user_service
+from app.core.dependencies import get_db, get_current_user_id
+from app.core.database import Session
 
 router = APIRouter()
 
 
-@router.get("/me", response_model=UserDetailResponse)
-async def get_current_user_details(
-    user_service = Depends(get_user_service)
+def get_user_controller(db: Session = Depends(get_db)) -> UserController:
+    """Get user controller."""
+    user_repository = UserRepository(db)
+    user_service = UserService(user_repository)
+    return UserController(user_service)
+
+
+@router.post("/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def create_user(
+    user_data: UserCreate,
+    user_controller: UserController = Depends(get_user_controller),
 ):
-    """Get current user details."""
-    controller = UserController(user_service)
-    return await controller.get_current_user_details()
+    """Create a new user."""
+    return await user_controller.create_user(user_data)
 
 
-@router.get("/{user_id}", response_model=UserDetailResponse)
-async def get_user_details(
-    user_id: str,
-    user_service = Depends(get_user_service)
+@router.get("/", response_model=UserListResponse)
+async def get_users(
+    skip: int = Query(0, ge=0, description="Number of users to skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Number of users to return"),
+    search: Optional[str] = Query(None, description="Search term for email or name"),
+    is_active: Optional[bool] = Query(None, description="Filter by active status"),
+    user_controller: UserController = Depends(get_user_controller),
 ):
-    """Get user details by ID."""
-    controller = UserController(user_service)
-    return await controller.get_user_details(user_id)
+    """Get list of users."""
+    return await user_controller.get_users(
+        skip=skip,
+        limit=limit,
+        search=search,
+        is_active=is_active,
+    )
 
 
-@router.post("/search", response_model=Dict[str, Any])
-async def search_users(
-    filters: UserSearchFilters,
-    skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
-    user_service = Depends(get_user_service)
-):
-    """Search users (admin only)."""
-    controller = UserController(user_service)
-    return await controller.search_users(filters, skip, limit)
-
-
-@router.put("/{user_id}/admin", response_model=UserDetailResponse)
-async def update_user_admin(
-    user_id: str,
-    user_data: UserUpdateAdmin,
-    user_service = Depends(get_user_service)
-):
-    """Update user (admin only)."""
-    controller = UserController(user_service)
-    return await controller.update_user_admin(user_id, user_data)
-
-
-@router.get("/stats/overview", response_model=UserStatsResponse)
-async def get_user_stats(
-    user_service = Depends(get_user_service)
-):
-    """Get user statistics (admin only)."""
-    controller = UserController(user_service)
-    return await controller.get_user_stats()
-
-
-@router.post("/bulk-action")
-async def bulk_user_action(
-    action_data: BulkUserAction,
-    user_service = Depends(get_user_service)
-):
-    """Perform bulk action on users (admin only)."""
-    controller = UserController(user_service)
-    return await controller.bulk_user_action(action_data)
-
-
-# Profile routes
-@router.get("/profile/me", response_model=UserProfileResponse)
-async def get_current_user_profile(
-    user_service = Depends(get_user_service)
+@router.get("/me", response_model=UserResponse)
+async def get_current_user(
+    current_user_id: int = Depends(get_current_user_id),
+    user_controller: UserController = Depends(get_user_controller),
 ):
     """Get current user profile."""
-    controller = UserController(user_service)
-    return await controller.get_user_profile()
+    return await user_controller.get_user(current_user_id)
+
+
+@router.get("/me/profile", response_model=UserProfileResponse)
+async def get_current_user_profile(
+    current_user_id: int = Depends(get_current_user_id),
+    user_controller: UserController = Depends(get_user_controller),
+):
+    """Get current user profile with additional details."""
+    return await user_controller.get_user_profile(current_user_id)
+
+
+@router.get("/me/stats", response_model=UserStatsResponse)
+async def get_current_user_stats(
+    current_user_id: int = Depends(get_current_user_id),
+    user_controller: UserController = Depends(get_user_controller),
+):
+    """Get current user statistics."""
+    return await user_controller.get_user_stats(current_user_id)
+
+
+@router.get("/{user_id}", response_model=UserResponse)
+async def get_user(
+    user_id: int,
+    user_controller: UserController = Depends(get_user_controller),
+):
+    """Get user by ID."""
+    return await user_controller.get_user(user_id)
 
 
 @router.get("/{user_id}/profile", response_model=UserProfileResponse)
 async def get_user_profile(
-    user_id: str,
-    user_service = Depends(get_user_service)
+    user_id: int,
+    user_controller: UserController = Depends(get_user_controller),
 ):
     """Get user profile by ID."""
-    controller = UserController(user_service)
-    return await controller.get_user_profile(user_id)
+    return await user_controller.get_user_profile(user_id)
 
 
-@router.post("/profile", response_model=UserProfileResponse, status_code=201)
-async def create_user_profile(
-    profile_data: UserProfileCreate,
-    user_service = Depends(get_user_service)
+@router.get("/{user_id}/stats", response_model=UserStatsResponse)
+async def get_user_stats(
+    user_id: int,
+    user_controller: UserController = Depends(get_user_controller),
 ):
-    """Create user profile."""
-    controller = UserController(user_service)
-    return await controller.create_user_profile(profile_data)
+    """Get user statistics by ID."""
+    return await user_controller.get_user_stats(user_id)
 
 
-@router.put("/profile", response_model=UserProfileResponse)
-async def update_user_profile(
-    profile_data: UserProfileUpdate,
-    user_service = Depends(get_user_service)
+@router.put("/{user_id}", response_model=UserResponse)
+async def update_user(
+    user_id: int,
+    user_data: UserUpdate,
+    user_controller: UserController = Depends(get_user_controller),
 ):
-    """Update user profile."""
-    controller = UserController(user_service)
-    return await controller.update_user_profile(profile_data)
+    """Update user."""
+    return await user_controller.update_user(user_id, user_data)
 
 
-# Preferences routes
-@router.get("/preferences", response_model=UserPreferencesResponse)
-async def get_user_preferences(
-    user_service = Depends(get_user_service)
+@router.put("/me", response_model=UserResponse)
+async def update_current_user(
+    user_data: UserUpdate,
+    current_user_id: int = Depends(get_current_user_id),
+    user_controller: UserController = Depends(get_user_controller),
 ):
-    """Get user preferences."""
-    controller = UserController(user_service)
-    return await controller.get_user_preferences()
+    """Update current user."""
+    return await user_controller.update_user(current_user_id, user_data)
 
 
-@router.put("/preferences", response_model=UserPreferencesResponse)
-async def update_user_preferences(
-    preferences_data: UserPreferencesUpdate,
-    user_service = Depends(get_user_service)
+@router.delete("/{user_id}")
+async def delete_user(
+    user_id: int,
+    user_controller: UserController = Depends(get_user_controller),
 ):
-    """Update user preferences."""
-    controller = UserController(user_service)
-    return await controller.update_user_preferences(preferences_data)
+    """Delete user."""
+    return await user_controller.delete_user(user_id)
 
 
-# Activity routes
-@router.get("/activities", response_model=List[UserActivityResponse])
-async def get_user_activities(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
-    user_service = Depends(get_user_service)
+@router.post("/bulk-update")
+async def bulk_update_users(
+    user_updates: List[Dict[str, Any]],
+    user_controller: UserController = Depends(get_user_controller),
 ):
-    """Get user activities."""
-    controller = UserController(user_service)
-    return await controller.get_user_activities(skip, limit)
-
-
-@router.post("/activities", response_model=UserActivityResponse, status_code=201)
-async def create_user_activity(
-    activity_data: UserActivityCreate,
-    user_service = Depends(get_user_service)
-):
-    """Create user activity."""
-    controller = UserController(user_service)
-    return await controller.create_user_activity(activity_data)
-
-
-# Session routes
-@router.get("/sessions", response_model=List[UserSessionResponse])
-async def get_user_sessions(
-    active_only: bool = Query(True),
-    user_service = Depends(get_user_service)
-):
-    """Get user sessions."""
-    controller = UserController(user_service)
-    return await controller.get_user_sessions(active_only)
-
-
-@router.delete("/sessions/{session_id}")
-async def deactivate_user_session(
-    session_id: str,
-    user_service = Depends(get_user_service)
-):
-    """Deactivate user session."""
-    controller = UserController(user_service)
-    return await controller.deactivate_user_session(session_id)
+    """Bulk update users."""
+    return await user_controller.bulk_update_users(user_updates)

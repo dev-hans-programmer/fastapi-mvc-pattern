@@ -1,251 +1,190 @@
 """
-Base repository class for database operations
+Base repository class for data access layer
 """
-import logging
-from abc import ABC, abstractmethod
-from typing import Any, Dict, Generic, List, Optional, Type, TypeVar, Union
-from sqlalchemy.orm import Session
-from sqlalchemy.ext.declarative import DeclarativeMeta
-from sqlalchemy import and_, or_, desc, asc
-from pydantic import BaseModel
 
-from app.core.exceptions import ResourceNotFoundException, ValidationException
+import logging
+from typing import Any, Dict, List, Optional
+from abc import ABC, abstractmethod
+from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-# Type variables for generic repository
-ModelType = TypeVar("ModelType", bound=DeclarativeMeta)
-CreateSchemaType = TypeVar("CreateSchemaType", bound=BaseModel)
-UpdateSchemaType = TypeVar("UpdateSchemaType", bound=BaseModel)
 
-
-class BaseRepository(ABC, Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
-    """Base repository class with common CRUD operations."""
+class BaseRepository(ABC):
+    """
+    Base repository class providing common database operations
+    """
     
-    def __init__(self, db: Session, model: Type[ModelType]):
-        self.db = db
-        self.model = model
+    def __init__(self, db_session: Optional[AsyncSession] = None):
+        self.db_session = db_session
     
-    def create(self, obj_in: CreateSchemaType) -> ModelType:
-        """Create a new record."""
-        try:
-            obj_in_data = obj_in.dict()
-            db_obj = self.model(**obj_in_data)
-            self.db.add(db_obj)
-            self.db.commit()
-            self.db.refresh(db_obj)
-            
-            logger.info(f"Created new {self.model.__name__} with ID: {db_obj.id}")
-            return db_obj
+    async def execute_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Execute a raw SQL query
+        """
+        if not self.db_session:
+            raise RuntimeError("Database session not available")
         
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Failed to create {self.model.__name__}: {str(e)}")
-            raise ValidationException(f"Failed to create {self.model.__name__}: {str(e)}")
-    
-    def get(self, id: Any) -> Optional[ModelType]:
-        """Get a record by ID."""
         try:
-            obj = self.db.query(self.model).filter(self.model.id == id).first()
-            if obj:
-                logger.debug(f"Retrieved {self.model.__name__} with ID: {id}")
-            return obj
-        
+            result = await self.db_session.execute(query, params or {})
+            return result
         except Exception as e:
-            logger.error(f"Failed to get {self.model.__name__} with ID {id}: {str(e)}")
+            logger.error(f"Query execution failed: {e}")
             raise
     
-    def get_by_id(self, id: Any) -> ModelType:
-        """Get a record by ID, raise exception if not found."""
-        obj = self.get(id)
-        if not obj:
-            raise ResourceNotFoundException(self.model.__name__, id)
-        return obj
+    async def fetch_one(self, query: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Fetch one row from query result
+        """
+        result = await self.execute_query(query, params)
+        row = result.fetchone()
+        return dict(row) if row else None
     
-    def get_multi(
-        self,
-        skip: int = 0,
-        limit: int = 100,
-        filters: Optional[Dict[str, Any]] = None,
-        order_by: Optional[str] = None,
-        order_desc: bool = False
-    ) -> List[ModelType]:
-        """Get multiple records with optional filtering and pagination."""
+    async def fetch_all(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetch all rows from query result
+        """
+        result = await self.execute_query(query, params)
+        rows = result.fetchall()
+        return [dict(row) for row in rows]
+    
+    async def execute_many(self, query: str, params_list: List[Dict[str, Any]]) -> None:
+        """
+        Execute query with multiple parameter sets
+        """
+        if not self.db_session:
+            raise RuntimeError("Database session not available")
+        
         try:
-            query = self.db.query(self.model)
-            
-            # Apply filters
-            if filters:
-                for key, value in filters.items():
-                    if hasattr(self.model, key) and value is not None:
-                        if isinstance(value, list):
-                            query = query.filter(getattr(self.model, key).in_(value))
-                        else:
-                            query = query.filter(getattr(self.model, key) == value)
-            
-            # Apply ordering
-            if order_by and hasattr(self.model, order_by):
-                if order_desc:
-                    query = query.order_by(desc(getattr(self.model, order_by)))
+            for params in params_list:
+                await self.db_session.execute(query, params)
+        except Exception as e:
+            logger.error(f"Batch execution failed: {e}")
+            raise
+    
+    async def begin_transaction(self):
+        """
+        Begin a database transaction
+        """
+        if not self.db_session:
+            raise RuntimeError("Database session not available")
+        
+        return self.db_session.begin()
+    
+    async def commit_transaction(self):
+        """
+        Commit the current transaction
+        """
+        if not self.db_session:
+            raise RuntimeError("Database session not available")
+        
+        await self.db_session.commit()
+    
+    async def rollback_transaction(self):
+        """
+        Rollback the current transaction
+        """
+        if not self.db_session:
+            raise RuntimeError("Database session not available")
+        
+        await self.db_session.rollback()
+    
+    def build_where_clause(self, filters: Dict[str, Any], table_alias: str = "") -> tuple:
+        """
+        Build WHERE clause from filters
+        """
+        conditions = []
+        params = {}
+        
+        prefix = f"{table_alias}." if table_alias else ""
+        
+        for key, value in filters.items():
+            if value is not None:
+                if isinstance(value, list):
+                    # IN clause
+                    placeholders = ", ".join([f":filter_{key}_{i}" for i in range(len(value))])
+                    conditions.append(f"{prefix}{key} IN ({placeholders})")
+                    for i, val in enumerate(value):
+                        params[f"filter_{key}_{i}"] = val
+                elif isinstance(value, dict):
+                    # Range or comparison operators
+                    if "gte" in value:
+                        conditions.append(f"{prefix}{key} >= :filter_{key}_gte")
+                        params[f"filter_{key}_gte"] = value["gte"]
+                    if "lte" in value:
+                        conditions.append(f"{prefix}{key} <= :filter_{key}_lte")
+                        params[f"filter_{key}_lte"] = value["lte"]
+                    if "gt" in value:
+                        conditions.append(f"{prefix}{key} > :filter_{key}_gt")
+                        params[f"filter_{key}_gt"] = value["gt"]
+                    if "lt" in value:
+                        conditions.append(f"{prefix}{key} < :filter_{key}_lt")
+                        params[f"filter_{key}_lt"] = value["lt"]
+                    if "like" in value:
+                        conditions.append(f"{prefix}{key} LIKE :filter_{key}_like")
+                        params[f"filter_{key}_like"] = f"%{value['like']}%"
                 else:
-                    query = query.order_by(asc(getattr(self.model, order_by)))
-            
-            # Apply pagination
-            objects = query.offset(skip).limit(limit).all()
-            
-            logger.debug(f"Retrieved {len(objects)} {self.model.__name__} records")
-            return objects
+                    # Exact match
+                    conditions.append(f"{prefix}{key} = :filter_{key}")
+                    params[f"filter_{key}"] = value
         
-        except Exception as e:
-            logger.error(f"Failed to get multiple {self.model.__name__}: {str(e)}")
-            raise
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        return where_clause, params
     
-    def update(self, id: Any, obj_in: Union[UpdateSchemaType, Dict[str, Any]]) -> ModelType:
-        """Update a record."""
-        try:
-            db_obj = self.get_by_id(id)
-            
-            if isinstance(obj_in, dict):
-                update_data = obj_in
-            else:
-                update_data = obj_in.dict(exclude_unset=True)
-            
-            for field, value in update_data.items():
-                if hasattr(db_obj, field):
-                    setattr(db_obj, field, value)
-            
-            self.db.commit()
-            self.db.refresh(db_obj)
-            
-            logger.info(f"Updated {self.model.__name__} with ID: {id}")
-            return db_obj
+    def build_order_clause(self, sort_by: Optional[str], sort_order: str = "asc", table_alias: str = "") -> str:
+        """
+        Build ORDER BY clause
+        """
+        if not sort_by:
+            return ""
         
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Failed to update {self.model.__name__} with ID {id}: {str(e)}")
-            raise ValidationException(f"Failed to update {self.model.__name__}: {str(e)}")
+        prefix = f"{table_alias}." if table_alias else ""
+        direction = "DESC" if sort_order.lower() == "desc" else "ASC"
+        
+        return f"ORDER BY {prefix}{sort_by} {direction}"
     
-    def delete(self, id: Any) -> bool:
-        """Delete a record."""
+    def build_limit_clause(self, limit: Optional[int], offset: int = 0) -> str:
+        """
+        Build LIMIT and OFFSET clause
+        """
+        if limit is None:
+            return ""
+        
+        return f"LIMIT {limit} OFFSET {offset}"
+    
+    async def health_check(self) -> bool:
+        """
+        Check if repository/database is healthy
+        """
         try:
-            db_obj = self.get_by_id(id)
-            self.db.delete(db_obj)
-            self.db.commit()
-            
-            logger.info(f"Deleted {self.model.__name__} with ID: {id}")
+            await self.execute_query("SELECT 1")
             return True
-        
         except Exception as e:
-            self.db.rollback()
-            logger.error(f"Failed to delete {self.model.__name__} with ID {id}: {str(e)}")
-            raise ValidationException(f"Failed to delete {self.model.__name__}: {str(e)}")
+            logger.error(f"Repository health check failed: {e}")
+            return False
     
-    def count(self, filters: Optional[Dict[str, Any]] = None) -> int:
-        """Count records with optional filtering."""
-        try:
-            query = self.db.query(self.model)
-            
-            # Apply filters
-            if filters:
-                for key, value in filters.items():
-                    if hasattr(self.model, key) and value is not None:
-                        if isinstance(value, list):
-                            query = query.filter(getattr(self.model, key).in_(value))
-                        else:
-                            query = query.filter(getattr(self.model, key) == value)
-            
-            count = query.count()
-            logger.debug(f"Counted {count} {self.model.__name__} records")
-            return count
-        
-        except Exception as e:
-            logger.error(f"Failed to count {self.model.__name__}: {str(e)}")
-            raise
+    def __enter__(self):
+        """
+        Context manager entry
+        """
+        return self
     
-    def exists(self, id: Any) -> bool:
-        """Check if a record exists."""
-        try:
-            return self.db.query(self.model).filter(self.model.id == id).first() is not None
-        
-        except Exception as e:
-            logger.error(f"Failed to check existence of {self.model.__name__} with ID {id}: {str(e)}")
-            raise
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Context manager exit
+        """
+        # Clean up resources if needed
+        pass
     
-    def bulk_create(self, objects: List[CreateSchemaType]) -> List[ModelType]:
-        """Create multiple records in bulk."""
-        try:
-            db_objects = []
-            for obj_in in objects:
-                obj_in_data = obj_in.dict()
-                db_obj = self.model(**obj_in_data)
-                db_objects.append(db_obj)
-            
-            self.db.add_all(db_objects)
-            self.db.commit()
-            
-            # Refresh all objects
-            for db_obj in db_objects:
-                self.db.refresh(db_obj)
-            
-            logger.info(f"Bulk created {len(db_objects)} {self.model.__name__} records")
-            return db_objects
-        
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Failed to bulk create {self.model.__name__}: {str(e)}")
-            raise ValidationException(f"Failed to bulk create {self.model.__name__}: {str(e)}")
+    async def __aenter__(self):
+        """
+        Async context manager entry
+        """
+        return self
     
-    def bulk_update(self, updates: List[Dict[str, Any]]) -> bool:
-        """Update multiple records in bulk."""
-        try:
-            for update_data in updates:
-                if 'id' not in update_data:
-                    continue
-                
-                obj_id = update_data.pop('id')
-                self.db.query(self.model).filter(self.model.id == obj_id).update(update_data)
-            
-            self.db.commit()
-            logger.info(f"Bulk updated {len(updates)} {self.model.__name__} records")
-            return True
-        
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Failed to bulk update {self.model.__name__}: {str(e)}")
-            raise ValidationException(f"Failed to bulk update {self.model.__name__}: {str(e)}")
-    
-    def bulk_delete(self, ids: List[Any]) -> bool:
-        """Delete multiple records in bulk."""
-        try:
-            self.db.query(self.model).filter(self.model.id.in_(ids)).delete(synchronize_session=False)
-            self.db.commit()
-            
-            logger.info(f"Bulk deleted {len(ids)} {self.model.__name__} records")
-            return True
-        
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Failed to bulk delete {self.model.__name__}: {str(e)}")
-            raise ValidationException(f"Failed to bulk delete {self.model.__name__}: {str(e)}")
-    
-    def search(self, query: str, fields: List[str]) -> List[ModelType]:
-        """Search records by query string in specified fields."""
-        try:
-            db_query = self.db.query(self.model)
-            
-            # Build search conditions
-            conditions = []
-            for field in fields:
-                if hasattr(self.model, field):
-                    conditions.append(getattr(self.model, field).ilike(f"%{query}%"))
-            
-            if conditions:
-                db_query = db_query.filter(or_(*conditions))
-            
-            results = db_query.all()
-            logger.debug(f"Search returned {len(results)} {self.model.__name__} records")
-            return results
-        
-        except Exception as e:
-            logger.error(f"Failed to search {self.model.__name__}: {str(e)}")
-            raise
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """
+        Async context manager exit
+        """
+        # Clean up resources if needed
+        pass

@@ -1,133 +1,120 @@
 """
-Middleware configuration and setup
+Custom middleware for the application.
 """
-
 import time
-import logging
-from typing import Callable, Optional
-from fastapi import FastAPI, Request, Response
-from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.middleware.sessions import SessionMiddleware
 import uuid
-from contextvars import ContextVar
+from typing import Callable
+from fastapi import Request, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+import logging
 
-from app.core.config import get_settings
-from app.core.logging import log_request, log_error
+from app.core.exceptions import BaseCustomException
 
-settings = get_settings()
 logger = logging.getLogger(__name__)
 
-# Context variables
-request_id_var: ContextVar[str] = ContextVar("request_id", default="")
-user_id_var: ContextVar[Optional[str]] = ContextVar("user_id", default=None)
 
-
-class RequestIDMiddleware(BaseHTTPMiddleware):
-    """
-    Middleware to add request ID to each request
-    """
+class LoggingMiddleware(BaseHTTPMiddleware):
+    """Middleware for logging requests and responses."""
     
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        # Generate or get request ID
-        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-        
-        # Set request ID in context
-        request_id_var.set(request_id)
-        
-        # Add request ID to request state
+    async def dispatch(self, request: Request, call_next: Callable):
+        # Generate request ID
+        request_id = str(uuid.uuid4())
         request.state.request_id = request_id
+        
+        # Log request
+        start_time = time.time()
+        
+        logger.info(
+            f"Request started: {request.method} {request.url.path}",
+            extra={
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "query_params": str(request.query_params),
+                "client_ip": request.client.host,
+                "user_agent": request.headers.get("user-agent"),
+            },
+        )
         
         # Process request
         response = await call_next(request)
         
+        # Log response
+        process_time = time.time() - start_time
+        
+        logger.info(
+            f"Request completed: {request.method} {request.url.path}",
+            extra={
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "process_time": round(process_time, 3),
+            },
+        )
+        
         # Add request ID to response headers
         response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time"] = str(round(process_time, 3))
         
         return response
 
 
-class LoggingMiddleware(BaseHTTPMiddleware):
-    """
-    Middleware for request/response logging
-    """
+class ErrorHandlerMiddleware(BaseHTTPMiddleware):
+    """Middleware for handling errors gracefully."""
     
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        start_time = time.time()
-        
-        # Get request info
-        method = request.method
-        url = str(request.url)
-        user_agent = request.headers.get("User-Agent", "")
-        remote_addr = request.client.host if request.client else "unknown"
-        
-        # Log request start
-        logger.info(
-            f"Request started: {method} {url}",
-            extra={
-                "method": method,
-                "url": url,
-                "user_agent": user_agent,
-                "remote_addr": remote_addr,
-                "request_id": getattr(request.state, "request_id", ""),
-            },
-        )
-        
+    async def dispatch(self, request: Request, call_next: Callable):
         try:
-            # Process request
             response = await call_next(request)
-            
-            # Calculate duration
-            duration = time.time() - start_time
-            
-            # Log successful request
-            log_request(
-                method=method,
-                url=url,
-                status_code=response.status_code,
-                duration=duration,
-                user_id=getattr(request.state, "user_id", None),
-                extra={
-                    "user_agent": user_agent,
-                    "remote_addr": remote_addr,
-                    "request_id": getattr(request.state, "request_id", ""),
-                },
-            )
-            
-            # Add timing header
-            response.headers["X-Process-Time"] = str(duration)
-            
             return response
-            
-        except Exception as e:
-            # Calculate duration
-            duration = time.time() - start_time
-            
-            # Log error
-            log_error(
-                error=e,
-                context={
-                    "method": method,
-                    "url": url,
-                    "duration": duration,
-                    "user_agent": user_agent,
-                    "remote_addr": remote_addr,
-                    "request_id": getattr(request.state, "request_id", ""),
+        except BaseCustomException as exc:
+            logger.error(
+                f"Custom exception in middleware: {exc.message}",
+                extra={
+                    "status_code": exc.status_code,
+                    "details": exc.details,
+                    "path": request.url.path,
+                    "method": request.method,
                 },
-                user_id=getattr(request.state, "user_id", None),
             )
             
-            # Re-raise exception
-            raise
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={
+                    "error": {
+                        "message": exc.message,
+                        "code": exc.status_code,
+                        "details": exc.details,
+                    }
+                },
+            )
+        except Exception as exc:
+            logger.error(
+                f"Unexpected exception in middleware: {str(exc)}",
+                extra={
+                    "path": request.url.path,
+                    "method": request.method,
+                    "exception_type": type(exc).__name__,
+                },
+                exc_info=True,
+            )
+            
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "message": "Internal server error",
+                        "code": 500,
+                    }
+                },
+            )
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """
-    Middleware to add security headers
-    """
+    """Middleware for adding security headers."""
     
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(self, request: Request, call_next: Callable):
         response = await call_next(request)
         
         # Add security headers
@@ -135,149 +122,65 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Content-Security-Policy"] = "default-src 'self'"
         
         return response
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """
-    Simple rate limiting middleware
-    """
+    """Simple rate limiting middleware."""
     
-    def __init__(self, app, calls: int = 100, period: int = 60):
+    def __init__(self, app, max_requests: int = 100, window_seconds: int = 60):
         super().__init__(app)
-        self.calls = calls
-        self.period = period
-        self.clients = {}
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests = {}
     
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        # Get client IP
-        client_ip = request.client.host if request.client else "unknown"
-        
-        # Skip rate limiting for health checks
-        if request.url.path in ["/health", "/health/", "/health/ready", "/health/live"]:
-            return await call_next(request)
-        
-        # Check rate limit
+    async def dispatch(self, request: Request, call_next: Callable):
+        client_ip = request.client.host
         current_time = time.time()
         
-        if client_ip not in self.clients:
-            self.clients[client_ip] = []
+        # Clean old entries
+        cutoff_time = current_time - self.window_seconds
+        self.requests = {
+            ip: [req_time for req_time in requests if req_time > cutoff_time]
+            for ip, requests in self.requests.items()
+        }
         
-        # Clean old requests
-        self.clients[client_ip] = [
-            req_time for req_time in self.clients[client_ip]
-            if current_time - req_time < self.period
-        ]
+        # Check rate limit
+        if client_ip not in self.requests:
+            self.requests[client_ip] = []
         
-        # Check if rate limit exceeded
-        if len(self.clients[client_ip]) >= self.calls:
-            from app.core.exceptions import RateLimitException
-            raise RateLimitException(
-                message=f"Rate limit exceeded. Max {self.calls} requests per {self.period} seconds",
-                retry_after=self.period,
+        if len(self.requests[client_ip]) >= self.max_requests:
+            logger.warning(
+                f"Rate limit exceeded for IP: {client_ip}",
+                extra={
+                    "client_ip": client_ip,
+                    "requests_count": len(self.requests[client_ip]),
+                    "max_requests": self.max_requests,
+                },
+            )
+            
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": {
+                        "message": "Rate limit exceeded",
+                        "code": 429,
+                    }
+                },
             )
         
         # Add current request
-        self.clients[client_ip].append(current_time)
+        self.requests[client_ip].append(current_time)
         
-        # Process request
         response = await call_next(request)
         
         # Add rate limit headers
-        response.headers["X-RateLimit-Limit"] = str(self.calls)
-        response.headers["X-RateLimit-Remaining"] = str(self.calls - len(self.clients[client_ip]))
-        response.headers["X-RateLimit-Reset"] = str(int(current_time + self.period))
+        response.headers["X-RateLimit-Limit"] = str(self.max_requests)
+        response.headers["X-RateLimit-Remaining"] = str(
+            self.max_requests - len(self.requests[client_ip])
+        )
+        response.headers["X-RateLimit-Reset"] = str(int(current_time + self.window_seconds))
         
         return response
-
-
-class ErrorHandlingMiddleware(BaseHTTPMiddleware):
-    """
-    Middleware for error handling and recovery
-    """
-    
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        try:
-            response = await call_next(request)
-            return response
-        except Exception as e:
-            # Log the error
-            log_error(
-                error=e,
-                context={
-                    "method": request.method,
-                    "url": str(request.url),
-                    "request_id": getattr(request.state, "request_id", ""),
-                },
-                user_id=getattr(request.state, "user_id", None),
-            )
-            
-            # Re-raise for proper handling by exception handlers
-            raise
-
-
-def setup_middleware(app: FastAPI) -> None:
-    """
-    Setup middleware for the FastAPI application
-    """
-    # Add compression middleware
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
-    
-    # Add trusted host middleware (only in production)
-    if settings.ENVIRONMENT == "production":
-        app.add_middleware(
-            TrustedHostMiddleware,
-            allowed_hosts=["*"],  # Configure based on your needs
-        )
-    
-    # Add session middleware
-    app.add_middleware(
-        SessionMiddleware,
-        secret_key=settings.SECRET_KEY,
-        max_age=3600,  # 1 hour
-    )
-    
-    # Add custom middleware
-    app.add_middleware(ErrorHandlingMiddleware)
-    
-    # Add rate limiting middleware
-    app.add_middleware(
-        RateLimitMiddleware,
-        calls=settings.RATE_LIMIT_REQUESTS,
-        period=settings.RATE_LIMIT_WINDOW,
-    )
-    
-    # Add security headers middleware
-    app.add_middleware(SecurityHeadersMiddleware)
-    
-    # Add logging middleware
-    app.add_middleware(LoggingMiddleware)
-    
-    # Add request ID middleware (should be first)
-    app.add_middleware(RequestIDMiddleware)
-    
-    logger.info("Middleware setup complete")
-
-
-def get_request_id() -> str:
-    """
-    Get current request ID from context
-    """
-    return request_id_var.get()
-
-
-def get_user_id() -> Optional[str]:
-    """
-    Get current user ID from context
-    """
-    return user_id_var.get()
-
-
-def set_user_id(user_id: str) -> None:
-    """
-    Set user ID in context
-    """
-    user_id_var.set(user_id)

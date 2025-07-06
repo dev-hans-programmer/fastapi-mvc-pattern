@@ -1,315 +1,101 @@
 """
-Logging configuration and setup
+Logging configuration and setup.
 """
-
 import logging
-import logging.config
-import os
 import sys
-from datetime import datetime
+from typing import Dict, Any
 from pathlib import Path
-from typing import Optional, Dict, Any
-import json
 
-from app.core.config import get_settings
-
-settings = get_settings()
-
-
-class JSONFormatter(logging.Formatter):
-    """
-    JSON formatter for structured logging
-    """
-    
-    def format(self, record: logging.LogRecord) -> str:
-        """
-        Format log record as JSON
-        """
-        # Create log entry
-        log_entry = {
-            "timestamp": datetime.fromtimestamp(record.created).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-            "module": record.module,
-            "function": record.funcName,
-            "line": record.lineno,
-            "thread": record.thread,
-            "thread_name": record.threadName,
-            "process": record.process,
-            "process_name": record.processName,
-        }
-        
-        # Add exception info if present
-        if record.exc_info:
-            log_entry["exception"] = self.formatException(record.exc_info)
-        
-        # Add extra fields
-        for key, value in record.__dict__.items():
-            if key not in [
-                "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
-                "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
-                "created", "msecs", "relativeCreated", "thread", "threadName",
-                "processName", "process", "message"
-            ]:
-                log_entry[key] = value
-        
-        return json.dumps(log_entry, ensure_ascii=False)
+from app.core.config import settings
 
 
 class ColoredFormatter(logging.Formatter):
-    """
-    Colored formatter for console output
-    """
+    """Colored log formatter for console output."""
     
-    # Color codes
     COLORS = {
         'DEBUG': '\033[36m',      # Cyan
         'INFO': '\033[32m',       # Green
         'WARNING': '\033[33m',    # Yellow
         'ERROR': '\033[31m',      # Red
         'CRITICAL': '\033[35m',   # Magenta
-        'RESET': '\033[0m'        # Reset
     }
+    RESET = '\033[0m'
     
-    def format(self, record: logging.LogRecord) -> str:
-        """
-        Format log record with colors
-        """
-        # Add color to levelname
-        levelname = record.levelname
-        if levelname in self.COLORS:
-            colored_levelname = f"{self.COLORS[levelname]}{levelname}{self.COLORS['RESET']}"
-            record.levelname = colored_levelname
-        
-        # Format the message
-        formatted = super().format(record)
-        
-        # Reset levelname for other formatters
-        record.levelname = levelname
-        
-        return formatted
+    def format(self, record):
+        log_message = super().format(record)
+        return f"{self.COLORS.get(record.levelname, '')}{log_message}{self.RESET}"
 
 
-def setup_logging(
-    log_level: Optional[str] = None,
-    log_file: Optional[str] = None,
-    json_format: bool = False,
-    enable_colors: bool = True,
-) -> None:
-    """
-    Setup logging configuration
-    """
-    log_level = log_level or settings.LOG_LEVEL
-    log_file = log_file or settings.LOG_FILE
+def setup_logging():
+    """Setup application logging."""
+    # Create logs directory
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
     
-    # Create logs directory if using file logging
-    if log_file:
-        log_path = Path(log_file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, settings.LOG_LEVEL))
     
-    # Configure logging
-    logging_config = {
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "standard": {
-                "format": settings.LOG_FORMAT,
-                "datefmt": "%Y-%m-%d %H:%M:%S",
-            },
-            "detailed": {
-                "format": (
-                    "%(asctime)s - %(name)s - %(levelname)s - "
-                    "%(module)s:%(funcName)s:%(lineno)d - %(message)s"
-                ),
-                "datefmt": "%Y-%m-%d %H:%M:%S",
-            },
-            "json": {
-                "()": JSONFormatter,
-            },
-            "colored": {
-                "()": ColoredFormatter,
-                "format": settings.LOG_FORMAT,
-                "datefmt": "%Y-%m-%d %H:%M:%S",
-            },
-        },
-        "handlers": {
-            "console": {
-                "class": "logging.StreamHandler",
-                "level": log_level,
-                "formatter": "colored" if enable_colors and not json_format else "standard",
-                "stream": sys.stdout,
-            },
-        },
-        "loggers": {
-            "": {  # Root logger
-                "handlers": ["console"],
-                "level": log_level,
-                "propagate": False,
-            },
-            "uvicorn": {
-                "handlers": ["console"],
-                "level": "INFO",
-                "propagate": False,
-            },
-            "uvicorn.access": {
-                "handlers": ["console"],
-                "level": "INFO",
-                "propagate": False,
-            },
-            "sqlalchemy": {
-                "handlers": ["console"],
-                "level": "WARNING",
-                "propagate": False,
-            },
-            "celery": {
-                "handlers": ["console"],
-                "level": "INFO",
-                "propagate": False,
-            },
-        },
-    }
+    # Remove existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
     
-    # Add file handler if log file is specified
-    if log_file:
-        logging_config["handlers"]["file"] = {
-            "class": "logging.handlers.RotatingFileHandler",
-            "level": log_level,
-            "formatter": "json" if json_format else "detailed",
-            "filename": log_file,
-            "maxBytes": 10 * 1024 * 1024,  # 10MB
-            "backupCount": 5,
-            "encoding": "utf-8",
-        }
-        
-        # Add file handler to all loggers
-        for logger_name in logging_config["loggers"]:
-            logging_config["loggers"][logger_name]["handlers"].append("file")
+    # Console handler with colored output
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(getattr(logging, settings.LOG_LEVEL))
+    console_formatter = ColoredFormatter(
+        fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    console_handler.setFormatter(console_formatter)
+    root_logger.addHandler(console_handler)
     
-    # Apply logging configuration
-    logging.config.dictConfig(logging_config)
+    # File handler for all logs
+    file_handler = logging.FileHandler(logs_dir / "app.log")
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        fmt="%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    file_handler.setFormatter(file_formatter)
+    root_logger.addHandler(file_handler)
     
-    # Log the configuration
-    logger = logging.getLogger(__name__)
-    logger.info(f"Logging configured - Level: {log_level}, File: {log_file or 'None'}")
+    # Error file handler
+    error_handler = logging.FileHandler(logs_dir / "error.log")
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(file_formatter)
+    root_logger.addHandler(error_handler)
+    
+    # Configure specific loggers
+    logging.getLogger("uvicorn").setLevel(logging.INFO)
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+    logging.getLogger("celery").setLevel(logging.INFO)
 
 
 def get_logger(name: str) -> logging.Logger:
-    """
-    Get logger instance
-    """
+    """Get logger instance."""
     return logging.getLogger(name)
 
 
-def log_request(
-    method: str,
-    url: str,
-    status_code: int,
-    duration: float,
-    user_id: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> None:
-    """
-    Log HTTP request
-    """
-    logger = get_logger("request")
+class StructuredLogger:
+    """Structured logger for JSON-like log entries."""
     
-    log_data = {
-        "method": method,
-        "url": url,
-        "status_code": status_code,
-        "duration": duration,
-        "user_id": user_id,
-    }
+    def __init__(self, name: str):
+        self.logger = logging.getLogger(name)
     
-    if extra:
-        log_data.update(extra)
+    def info(self, message: str, extra: Dict[str, Any] = None):
+        """Log info message with structured data."""
+        self.logger.info(message, extra=extra or {})
     
-    logger.info(f"{method} {url} - {status_code} - {duration:.3f}s", extra=log_data)
-
-
-def log_error(
-    error: Exception,
-    context: Optional[Dict[str, Any]] = None,
-    user_id: Optional[str] = None,
-) -> None:
-    """
-    Log error with context
-    """
-    logger = get_logger("error")
+    def error(self, message: str, extra: Dict[str, Any] = None):
+        """Log error message with structured data."""
+        self.logger.error(message, extra=extra or {})
     
-    log_data = {
-        "error_type": type(error).__name__,
-        "error_message": str(error),
-        "user_id": user_id,
-    }
+    def warning(self, message: str, extra: Dict[str, Any] = None):
+        """Log warning message with structured data."""
+        self.logger.warning(message, extra=extra or {})
     
-    if context:
-        log_data.update(context)
-    
-    logger.error(f"Error: {error}", extra=log_data, exc_info=True)
-
-
-def log_background_task(
-    task_name: str,
-    task_id: str,
-    status: str,
-    duration: Optional[float] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> None:
-    """
-    Log background task execution
-    """
-    logger = get_logger("background_task")
-    
-    log_data = {
-        "task_name": task_name,
-        "task_id": task_id,
-        "status": status,
-        "duration": duration,
-    }
-    
-    if extra:
-        log_data.update(extra)
-    
-    message = f"Background task {task_name} [{task_id}] - {status}"
-    if duration:
-        message += f" - {duration:.3f}s"
-    
-    logger.info(message, extra=log_data)
-
-
-def log_database_operation(
-    operation: str,
-    table: str,
-    record_id: Optional[str] = None,
-    duration: Optional[float] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> None:
-    """
-    Log database operation
-    """
-    logger = get_logger("database")
-    
-    log_data = {
-        "operation": operation,
-        "table": table,
-        "record_id": record_id,
-        "duration": duration,
-    }
-    
-    if extra:
-        log_data.update(extra)
-    
-    message = f"Database {operation} on {table}"
-    if record_id:
-        message += f" [{record_id}]"
-    if duration:
-        message += f" - {duration:.3f}s"
-    
-    logger.info(message, extra=log_data)
-
-
-# Setup logging on module import
-if not logging.getLogger().handlers:
-    setup_logging()
+    def debug(self, message: str, extra: Dict[str, Any] = None):
+        """Log debug message with structured data."""
+        self.logger.debug(message, extra=extra or {})

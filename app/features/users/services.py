@@ -1,444 +1,248 @@
 """
-User services
+Users services.
 """
+from typing import List, Optional, Tuple, Dict, Any
 import logging
-from typing import List, Optional, Dict, Any
-from sqlalchemy.orm import Session
+from datetime import datetime, timedelta
 
-from app.common.base_service import BaseService
-from app.features.users.repositories import (
-    UserRepository,
-    UserProfileRepository,
-    UserPreferencesRepository,
-    UserActivityRepository,
-    UserSessionRepository
+from app.features.users.repositories import UserRepository
+from app.features.users.types import (
+    UserCreate, UserUpdate, UserProfileResponse, UserStatsResponse
 )
-from app.features.users.schemas import (
-    UserDetailResponse,
-    UserProfileCreate,
-    UserProfileUpdate,
-    UserProfileResponse,
-    UserPreferencesCreate,
-    UserPreferencesUpdate,
-    UserPreferencesResponse,
-    UserActivityCreate,
-    UserActivityResponse,
-    UserSessionResponse,
-    UserUpdateAdmin,
-    UserStatsResponse,
-    UserSearchFilters,
-    BulkUserAction
-)
-from app.features.auth.models import User
-from app.core.exceptions import ValidationException, ResourceNotFoundException, BusinessLogicException
-from app.core.decorators import log_execution_time
-from app.core.background_tasks import submit_user_notification_task
+from app.models.user import User
+from app.core.exceptions import NotFoundException, ConflictException
+from app.core.security import get_password_hash
+from app.core.thread_pool import AsyncBatchProcessor
+from app.tasks.user_tasks import send_user_update_notification
 
 logger = logging.getLogger(__name__)
 
 
-class UserService(BaseService[User, dict, dict, UserRepository]):
-    """User service for user management."""
+class UserService:
+    """User service."""
     
-    def __init__(
-        self,
-        user_repository: UserRepository,
-        profile_repository: UserProfileRepository,
-        preferences_repository: UserPreferencesRepository,
-        activity_repository: UserActivityRepository,
-        session_repository: UserSessionRepository
-    ):
-        super().__init__(user_repository)
-        self.profile_repository = profile_repository
-        self.preferences_repository = preferences_repository
-        self.activity_repository = activity_repository
-        self.session_repository = session_repository
+    def __init__(self, user_repository: UserRepository):
+        self.user_repository = user_repository
     
-    @log_execution_time
-    def get_user_details(self, user_id: str) -> UserDetailResponse:
-        """Get user with all details."""
+    async def create_user(self, user_data: UserCreate) -> User:
+        """Create a new user."""
         try:
-            user = self.repository.get_user_with_details(user_id)
-            if not user:
-                raise ResourceNotFoundException("User", user_id)
+            # Check if user already exists
+            existing_user = await self.user_repository.get_by_email(user_data.email)
+            if existing_user:
+                raise ConflictException("User with this email already exists")
             
-            # Get profile
-            profile = self.profile_repository.get_by_user_id(user_id)
-            profile_data = UserProfileResponse.from_orm(profile) if profile else None
+            # Hash password if provided
+            user_dict = user_data.dict()
+            if user_data.password:
+                user_dict["hashed_password"] = get_password_hash(user_data.password)
+                del user_dict["password"]
             
-            # Get preferences
-            preferences = self.preferences_repository.get_by_user_id(user_id)
-            preferences_data = UserPreferencesResponse.from_orm(preferences) if preferences else None
+            # Create user
+            user = await self.user_repository.create(user_dict)
             
-            # Get recent activities
-            recent_activities = self.activity_repository.get_user_activities(user_id, limit=10)
-            activities_data = [UserActivityResponse.from_orm(activity) for activity in recent_activities]
-            
-            # Get active sessions
-            active_sessions = self.session_repository.get_user_sessions(user_id, active_only=True)
-            sessions_data = [UserSessionResponse.from_orm(session) for session in active_sessions]
-            
-            return UserDetailResponse(
-                id=str(user.id),
-                email=user.email,
-                username=user.username,
-                first_name=user.first_name,
-                last_name=user.last_name,
-                full_name=user.full_name,
-                is_active=user.is_active,
-                is_verified=user.is_verified,
-                is_superuser=user.is_superuser,
-                created_at=user.created_at,
-                updated_at=user.updated_at,
-                last_login=user.last_login,
-                profile=profile_data,
-                preferences=preferences_data,
-                recent_activities=activities_data,
-                active_sessions=sessions_data
-            )
+            logger.info(f"User created: {user.email}")
+            return user
         
-        except ResourceNotFoundException:
+        except Exception as e:
+            logger.error(f"Error in create_user: {str(e)}")
             raise
-        
-        except Exception as e:
-            logger.error(f"Error getting user details: {str(e)}")
-            raise BusinessLogicException("Failed to get user details")
     
-    @log_execution_time
-    def search_users(self, filters: UserSearchFilters, skip: int = 0, limit: int = 100) -> List[UserDetailResponse]:
-        """Search users with filters."""
+    async def get_user_by_id(self, user_id: int) -> Optional[User]:
+        """Get user by ID."""
         try:
-            users = self.repository.search_users(filters, skip, limit)
+            return await self.user_repository.get_by_id(user_id)
+        except Exception as e:
+            logger.error(f"Error in get_user_by_id: {str(e)}")
+            raise
+    
+    async def get_user_by_email(self, email: str) -> Optional[User]:
+        """Get user by email."""
+        try:
+            return await self.user_repository.get_by_email(email)
+        except Exception as e:
+            logger.error(f"Error in get_user_by_email: {str(e)}")
+            raise
+    
+    async def get_users(
+        self,
+        skip: int = 0,
+        limit: int = 100,
+        search: Optional[str] = None,
+        is_active: Optional[bool] = None,
+    ) -> Tuple[List[User], int]:
+        """Get list of users with pagination and filtering."""
+        try:
+            return await self.user_repository.get_multi(
+                skip=skip,
+                limit=limit,
+                search=search,
+                is_active=is_active,
+            )
+        except Exception as e:
+            logger.error(f"Error in get_users: {str(e)}")
+            raise
+    
+    async def update_user(self, user_id: int, user_data: UserUpdate) -> Optional[User]:
+        """Update user."""
+        try:
+            # Get existing user
+            existing_user = await self.user_repository.get_by_id(user_id)
+            if not existing_user:
+                raise NotFoundException(f"User with ID {user_id} not found")
             
-            return [
-                UserDetailResponse(
-                    id=str(user.id),
-                    email=user.email,
-                    username=user.username,
-                    first_name=user.first_name,
-                    last_name=user.last_name,
-                    full_name=user.full_name,
-                    is_active=user.is_active,
-                    is_verified=user.is_verified,
-                    is_superuser=user.is_superuser,
-                    created_at=user.created_at,
-                    updated_at=user.updated_at,
-                    last_login=user.last_login,
-                    profile=None,
-                    preferences=None,
-                    recent_activities=[],
-                    active_sessions=[]
-                ) for user in users
-            ]
-        
-        except Exception as e:
-            logger.error(f"Error searching users: {str(e)}")
-            raise BusinessLogicException("Failed to search users")
-    
-    @log_execution_time
-    def update_user_admin(self, user_id: str, user_data: UserUpdateAdmin) -> UserDetailResponse:
-        """Update user (admin operation)."""
-        try:
-            user = self.repository.get_by_id(user_id)
-            if not user:
-                raise ResourceNotFoundException("User", user_id)
+            # Check email uniqueness if email is being updated
+            if user_data.email and user_data.email != existing_user.email:
+                email_user = await self.user_repository.get_by_email(user_data.email)
+                if email_user:
+                    raise ConflictException("User with this email already exists")
             
             # Update user
             update_data = user_data.dict(exclude_unset=True)
-            updated_user = self.repository.update(user_id, update_data)
+            if "password" in update_data:
+                update_data["hashed_password"] = get_password_hash(update_data["password"])
+                del update_data["password"]
             
-            # Log activity
-            self.activity_repository.create_activity(
-                user_id=user_id,
-                activity_data=UserActivityCreate(
-                    activity_type="user_updated",
-                    activity_description="User profile updated by admin",
-                    resource_type="user",
-                    resource_id=user_id
-                )
-            )
+            user = await self.user_repository.update(user_id, update_data)
             
-            logger.info(f"User updated by admin: {user_id}")
-            return self.get_user_details(user_id)
-        
-        except ResourceNotFoundException:
-            raise
+            # Send notification (background task)
+            if user:
+                send_user_update_notification.delay(user.id, user.email)
+            
+            logger.info(f"User updated: {user.email if user else user_id}")
+            return user
         
         except Exception as e:
-            logger.error(f"Error updating user (admin): {str(e)}")
-            raise BusinessLogicException("Failed to update user")
+            logger.error(f"Error in update_user: {str(e)}")
+            raise
     
-    @log_execution_time
-    def get_user_stats(self) -> UserStatsResponse:
-        """Get user statistics."""
+    async def delete_user(self, user_id: int) -> bool:
+        """Delete user."""
         try:
-            stats = self.repository.get_user_stats()
+            # Check if user exists
+            existing_user = await self.user_repository.get_by_id(user_id)
+            if not existing_user:
+                raise NotFoundException(f"User with ID {user_id} not found")
+            
+            # Soft delete (deactivate) instead of hard delete
+            result = await self.user_repository.update(user_id, {"is_active": False})
+            
+            logger.info(f"User deactivated: {user_id}")
+            return result is not None
+        
+        except Exception as e:
+            logger.error(f"Error in delete_user: {str(e)}")
+            raise
+    
+    async def get_user_profile(self, user_id: int) -> Optional[UserProfileResponse]:
+        """Get user profile with additional details."""
+        try:
+            user = await self.user_repository.get_by_id(user_id)
+            if not user:
+                return None
+            
+            # Get additional profile information
+            profile_data = await self.user_repository.get_user_profile_data(user_id)
+            
+            return UserProfileResponse(
+                id=user.id,
+                email=user.email,
+                full_name=user.full_name,
+                is_active=user.is_active,
+                created_at=user.created_at,
+                updated_at=user.updated_at,
+                last_login=user.last_login,
+                order_count=profile_data.get("order_count", 0),
+                total_spent=profile_data.get("total_spent", 0.0),
+                favorite_products=profile_data.get("favorite_products", []),
+            )
+        
+        except Exception as e:
+            logger.error(f"Error in get_user_profile: {str(e)}")
+            raise
+    
+    def calculate_user_stats(self, user_id: int) -> Optional[UserStatsResponse]:
+        """Calculate user statistics (CPU-intensive operation)."""
+        try:
+            # This is a CPU-intensive operation that should run in thread pool
+            user = self.user_repository.get_by_id_sync(user_id)
+            if not user:
+                return None
+            
+            # Simulate heavy computation
+            import time
+            time.sleep(0.1)  # Simulate processing time
+            
+            stats_data = self.user_repository.calculate_user_stats_sync(user_id)
             
             return UserStatsResponse(
-                total_users=stats["total_users"],
-                active_users=stats["active_users"],
-                verified_users=stats["verified_users"],
-                new_users_today=stats["new_users_today"],
-                new_users_week=stats["new_users_week"],
-                new_users_month=stats["new_users_month"],
-                users_by_country=stats["users_by_country"],
-                activity_stats=stats["activity_stats"]
-            )
-        
-        except Exception as e:
-            logger.error(f"Error getting user stats: {str(e)}")
-            raise BusinessLogicException("Failed to get user statistics")
-    
-    @log_execution_time
-    def bulk_user_action(self, action_data: BulkUserAction) -> Dict[str, Any]:
-        """Perform bulk action on users."""
-        try:
-            user_ids = action_data.user_ids
-            action = action_data.action
-            
-            if action == "activate":
-                self.repository.bulk_update_users(user_ids, {"is_active": True})
-                message = f"Activated {len(user_ids)} users"
-            
-            elif action == "deactivate":
-                self.repository.bulk_update_users(user_ids, {"is_active": False})
-                message = f"Deactivated {len(user_ids)} users"
-            
-            elif action == "verify":
-                self.repository.bulk_update_users(user_ids, {"is_verified": True})
-                message = f"Verified {len(user_ids)} users"
-            
-            elif action == "unverify":
-                self.repository.bulk_update_users(user_ids, {"is_verified": False})
-                message = f"Unverified {len(user_ids)} users"
-            
-            elif action == "delete":
-                self.repository.bulk_delete_users(user_ids)
-                message = f"Deleted {len(user_ids)} users"
-            
-            else:
-                raise ValidationException(f"Invalid action: {action}")
-            
-            # Log bulk action
-            for user_id in user_ids:
-                self.activity_repository.create_activity(
-                    user_id=user_id,
-                    activity_data=UserActivityCreate(
-                        activity_type="bulk_action",
-                        activity_description=f"Bulk action performed: {action}",
-                        resource_type="user",
-                        resource_id=user_id
-                    )
-                )
-            
-            logger.info(f"Bulk action performed: {action} on {len(user_ids)} users")
-            return {"message": message, "affected_users": len(user_ids)}
-        
-        except ValidationException:
-            raise
-        
-        except Exception as e:
-            logger.error(f"Error performing bulk action: {str(e)}")
-            raise BusinessLogicException("Failed to perform bulk action")
-    
-    # Profile methods
-    @log_execution_time
-    def get_user_profile(self, user_id: str) -> Optional[UserProfileResponse]:
-        """Get user profile."""
-        try:
-            profile = self.profile_repository.get_by_user_id(user_id)
-            return UserProfileResponse.from_orm(profile) if profile else None
-        
-        except Exception as e:
-            logger.error(f"Error getting user profile: {str(e)}")
-            raise BusinessLogicException("Failed to get user profile")
-    
-    @log_execution_time
-    def create_user_profile(self, user_id: str, profile_data: UserProfileCreate) -> UserProfileResponse:
-        """Create user profile."""
-        try:
-            # Verify user exists
-            user = self.repository.get_by_id(user_id)
-            if not user:
-                raise ResourceNotFoundException("User", user_id)
-            
-            # Check if profile already exists
-            existing_profile = self.profile_repository.get_by_user_id(user_id)
-            if existing_profile:
-                raise ValidationException("User profile already exists")
-            
-            profile = self.profile_repository.create_profile(user_id, profile_data)
-            
-            # Log activity
-            self.activity_repository.create_activity(
                 user_id=user_id,
-                activity_data=UserActivityCreate(
-                    activity_type="profile_created",
-                    activity_description="User profile created",
-                    resource_type="profile",
-                    resource_id=str(profile.id)
-                )
+                total_orders=stats_data.get("total_orders", 0),
+                total_spent=stats_data.get("total_spent", 0.0),
+                average_order_value=stats_data.get("average_order_value", 0.0),
+                last_order_date=stats_data.get("last_order_date"),
+                favorite_category=stats_data.get("favorite_category"),
+                account_age_days=stats_data.get("account_age_days", 0),
             )
-            
-            logger.info(f"User profile created: {user_id}")
-            return UserProfileResponse.from_orm(profile)
         
-        except (ResourceNotFoundException, ValidationException):
+        except Exception as e:
+            logger.error(f"Error in calculate_user_stats: {str(e)}")
             raise
-        
-        except Exception as e:
-            logger.error(f"Error creating user profile: {str(e)}")
-            raise BusinessLogicException("Failed to create user profile")
     
-    @log_execution_time
-    def update_user_profile(self, user_id: str, profile_data: UserProfileUpdate) -> UserProfileResponse:
-        """Update user profile."""
+    async def bulk_update_users(self, user_updates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Bulk update users."""
         try:
-            # Verify user exists
-            user = self.repository.get_by_id(user_id)
-            if not user:
-                raise ResourceNotFoundException("User", user_id)
+            results = []
             
-            profile = self.profile_repository.update_profile(user_id, profile_data)
-            
-            # Log activity
-            self.activity_repository.create_activity(
-                user_id=user_id,
-                activity_data=UserActivityCreate(
-                    activity_type="profile_updated",
-                    activity_description="User profile updated",
-                    resource_type="profile",
-                    resource_id=str(profile.id)
-                )
-            )
-            
-            logger.info(f"User profile updated: {user_id}")
-            return UserProfileResponse.from_orm(profile)
-        
-        except ResourceNotFoundException:
-            raise
-        
-        except Exception as e:
-            logger.error(f"Error updating user profile: {str(e)}")
-            raise BusinessLogicException("Failed to update user profile")
-    
-    # Preferences methods
-    @log_execution_time
-    def get_user_preferences(self, user_id: str) -> Optional[UserPreferencesResponse]:
-        """Get user preferences."""
-        try:
-            preferences = self.preferences_repository.get_by_user_id(user_id)
-            return UserPreferencesResponse.from_orm(preferences) if preferences else None
-        
-        except Exception as e:
-            logger.error(f"Error getting user preferences: {str(e)}")
-            raise BusinessLogicException("Failed to get user preferences")
-    
-    @log_execution_time
-    def update_user_preferences(self, user_id: str, preferences_data: UserPreferencesUpdate) -> UserPreferencesResponse:
-        """Update user preferences."""
-        try:
-            # Verify user exists
-            user = self.repository.get_by_id(user_id)
-            if not user:
-                raise ResourceNotFoundException("User", user_id)
-            
-            preferences = self.preferences_repository.update_preferences(user_id, preferences_data)
-            
-            # Log activity
-            self.activity_repository.create_activity(
-                user_id=user_id,
-                activity_data=UserActivityCreate(
-                    activity_type="preferences_updated",
-                    activity_description="User preferences updated",
-                    resource_type="preferences",
-                    resource_id=str(preferences.id)
-                )
-            )
-            
-            logger.info(f"User preferences updated: {user_id}")
-            return UserPreferencesResponse.from_orm(preferences)
-        
-        except ResourceNotFoundException:
-            raise
-        
-        except Exception as e:
-            logger.error(f"Error updating user preferences: {str(e)}")
-            raise BusinessLogicException("Failed to update user preferences")
-    
-    # Activity methods
-    @log_execution_time
-    def get_user_activities(self, user_id: str, skip: int = 0, limit: int = 50) -> List[UserActivityResponse]:
-        """Get user activities."""
-        try:
-            activities = self.activity_repository.get_user_activities(user_id, skip, limit)
-            return [UserActivityResponse.from_orm(activity) for activity in activities]
-        
-        except Exception as e:
-            logger.error(f"Error getting user activities: {str(e)}")
-            raise BusinessLogicException("Failed to get user activities")
-    
-    @log_execution_time
-    def create_user_activity(self, user_id: str, activity_data: UserActivityCreate) -> UserActivityResponse:
-        """Create user activity."""
-        try:
-            # Verify user exists
-            user = self.repository.get_by_id(user_id)
-            if not user:
-                raise ResourceNotFoundException("User", user_id)
-            
-            activity = self.activity_repository.create_activity(user_id, activity_data)
-            
-            return UserActivityResponse.from_orm(activity)
-        
-        except ResourceNotFoundException:
-            raise
-        
-        except Exception as e:
-            logger.error(f"Error creating user activity: {str(e)}")
-            raise BusinessLogicException("Failed to create user activity")
-    
-    # Session methods
-    @log_execution_time
-    def get_user_sessions(self, user_id: str, active_only: bool = True) -> List[UserSessionResponse]:
-        """Get user sessions."""
-        try:
-            sessions = self.session_repository.get_user_sessions(user_id, active_only)
-            return [UserSessionResponse.from_orm(session) for session in sessions]
-        
-        except Exception as e:
-            logger.error(f"Error getting user sessions: {str(e)}")
-            raise BusinessLogicException("Failed to get user sessions")
-    
-    @log_execution_time
-    def deactivate_user_session(self, user_id: str, session_id: str) -> bool:
-        """Deactivate user session."""
-        try:
-            # Verify user exists
-            user = self.repository.get_by_id(user_id)
-            if not user:
-                raise ResourceNotFoundException("User", user_id)
-            
-            success = self.session_repository.deactivate_session(session_id)
-            
-            if success:
-                # Log activity
-                self.activity_repository.create_activity(
-                    user_id=user_id,
-                    activity_data=UserActivityCreate(
-                        activity_type="session_deactivated",
-                        activity_description="User session deactivated",
-                        resource_type="session",
-                        resource_id=session_id
-                    )
+            # Use batch processor for concurrent updates
+            async with AsyncBatchProcessor(batch_size=10) as processor:
+                
+                async def process_user_update(update_data: Dict[str, Any]) -> Dict[str, Any]:
+                    try:
+                        user_id = update_data.get("id")
+                        if not user_id:
+                            return {"id": None, "status": "error", "message": "Missing user ID"}
+                        
+                        # Remove id from update data
+                        update_fields = {k: v for k, v in update_data.items() if k != "id"}
+                        
+                        # Update user
+                        user = await self.user_repository.update(user_id, update_fields)
+                        
+                        if user:
+                            return {"id": user_id, "status": "success", "message": "User updated"}
+                        else:
+                            return {"id": user_id, "status": "error", "message": "User not found"}
+                    
+                    except Exception as e:
+                        return {"id": user_id, "status": "error", "message": str(e)}
+                
+                # Process all updates
+                results = await processor.process_batch(
+                    user_updates,
+                    process_user_update
                 )
             
-            logger.info(f"User session deactivated: {session_id}")
-            return success
-        
-        except ResourceNotFoundException:
-            raise
+            logger.info(f"Bulk update completed: {len(results)} users processed")
+            return results
         
         except Exception as e:
-            logger.error(f"Error deactivating user session: {str(e)}")
-            raise BusinessLogicException("Failed to deactivate user session")
+            logger.error(f"Error in bulk_update_users: {str(e)}")
+            raise
+    
+    async def get_active_users_count(self) -> int:
+        """Get count of active users."""
+        try:
+            return await self.user_repository.get_active_users_count()
+        except Exception as e:
+            logger.error(f"Error in get_active_users_count: {str(e)}")
+            raise
+    
+    async def get_users_registered_today(self) -> List[User]:
+        """Get users registered today."""
+        try:
+            today = datetime.utcnow().date()
+            return await self.user_repository.get_users_by_date_range(today, today)
+        except Exception as e:
+            logger.error(f"Error in get_users_registered_today: {str(e)}")
+            raise

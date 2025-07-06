@@ -1,3 +1,3 @@
 """
-Orders feature package
+Orders feature package.
 """

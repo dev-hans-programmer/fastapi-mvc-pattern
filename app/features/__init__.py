@@ -1,3 +1,3 @@
 """
-Feature modules package
+Features package initialization.
 """

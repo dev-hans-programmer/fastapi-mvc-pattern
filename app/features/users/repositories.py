@@ -1,451 +1,248 @@
 """
-User repositories
+Users repositories.
 """
-import logging
-from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_, or_
+from sqlalchemy import and_, or_, func, desc
+from datetime import datetime, date
+import logging
 
-from app.common.base_repository import BaseRepository
-from app.features.auth.models import User
-from app.features.users.models import UserProfile, UserPreferences, UserActivity, UserSession
-from app.features.users.schemas import (
-    UserProfileCreate, UserProfileUpdate,
-    UserPreferencesCreate, UserPreferencesUpdate,
-    UserActivityCreate, UserSearchFilters
-)
-from app.core.exceptions import ValidationException
+from app.models.user import User
+from app.core.exceptions import NotFoundException
 
 logger = logging.getLogger(__name__)
 
 
-class UserRepository(BaseRepository[User, dict, dict]):
-    """User repository for user management."""
+class UserRepository:
+    """User repository."""
     
     def __init__(self, db: Session):
-        super().__init__(db, User)
+        self.db = db
     
-    def get_user_with_details(self, user_id: str) -> Optional[User]:
-        """Get user with all related details."""
+    async def create(self, user_data: dict) -> User:
+        """Create a new user."""
+        try:
+            user = User(**user_data)
+            self.db.add(user)
+            self.db.commit()
+            self.db.refresh(user)
+            return user
+        except Exception as e:
+            logger.error(f"Error creating user: {str(e)}")
+            self.db.rollback()
+            raise
+    
+    async def get_by_id(self, user_id: int) -> Optional[User]:
+        """Get user by ID."""
         try:
             return self.db.query(User).filter(User.id == user_id).first()
         except Exception as e:
-            logger.error(f"Error getting user with details: {str(e)}")
+            logger.error(f"Error getting user by ID: {str(e)}")
             raise
     
-    def search_users(self, filters: UserSearchFilters, skip: int = 0, limit: int = 100) -> List[User]:
-        """Search users with filters."""
+    def get_by_id_sync(self, user_id: int) -> Optional[User]:
+        """Get user by ID (synchronous version for thread pool)."""
+        try:
+            return self.db.query(User).filter(User.id == user_id).first()
+        except Exception as e:
+            logger.error(f"Error getting user by ID (sync): {str(e)}")
+            raise
+    
+    async def get_by_email(self, email: str) -> Optional[User]:
+        """Get user by email."""
+        try:
+            return self.db.query(User).filter(User.email == email).first()
+        except Exception as e:
+            logger.error(f"Error getting user by email: {str(e)}")
+            raise
+    
+    async def get_multi(
+        self,
+        skip: int = 0,
+        limit: int = 100,
+        search: Optional[str] = None,
+        is_active: Optional[bool] = None,
+    ) -> Tuple[List[User], int]:
+        """Get multiple users with pagination and filtering."""
         try:
             query = self.db.query(User)
             
             # Apply filters
-            if filters.email:
-                query = query.filter(User.email.ilike(f"%{filters.email}%"))
+            if search:
+                search_term = f"%{search}%"
+                query = query.filter(
+                    or_(
+                        User.email.ilike(search_term),
+                        User.full_name.ilike(search_term),
+                    )
+                )
             
-            if filters.username:
-                query = query.filter(User.username.ilike(f"%{filters.username}%"))
+            if is_active is not None:
+                query = query.filter(User.is_active == is_active)
             
-            if filters.first_name:
-                query = query.filter(User.first_name.ilike(f"%{filters.first_name}%"))
+            # Get total count
+            total = query.count()
             
-            if filters.last_name:
-                query = query.filter(User.last_name.ilike(f"%{filters.last_name}%"))
+            # Apply pagination
+            users = query.offset(skip).limit(limit).all()
             
-            if filters.is_active is not None:
-                query = query.filter(User.is_active == filters.is_active)
-            
-            if filters.is_verified is not None:
-                query = query.filter(User.is_verified == filters.is_verified)
-            
-            if filters.is_superuser is not None:
-                query = query.filter(User.is_superuser == filters.is_superuser)
-            
-            if filters.created_after:
-                query = query.filter(User.created_at >= filters.created_after)
-            
-            if filters.created_before:
-                query = query.filter(User.created_at <= filters.created_before)
-            
-            if filters.last_login_after:
-                query = query.filter(User.last_login >= filters.last_login_after)
-            
-            if filters.last_login_before:
-                query = query.filter(User.last_login <= filters.last_login_before)
-            
-            # Join with profile for location filters
-            if filters.country or filters.city:
-                query = query.join(UserProfile, User.id == UserProfile.user_id)
-                
-                if filters.country:
-                    query = query.filter(UserProfile.country.ilike(f"%{filters.country}%"))
-                
-                if filters.city:
-                    query = query.filter(UserProfile.city.ilike(f"%{filters.city}%"))
-            
-            return query.offset(skip).limit(limit).all()
+            return users, total
         
         except Exception as e:
-            logger.error(f"Error searching users: {str(e)}")
+            logger.error(f"Error getting multiple users: {str(e)}")
             raise
     
-    def get_user_stats(self) -> Dict[str, Any]:
-        """Get user statistics."""
+    async def update(self, user_id: int, update_data: dict) -> Optional[User]:
+        """Update user."""
         try:
-            now = datetime.utcnow()
-            today = now.date()
-            week_ago = now - timedelta(days=7)
-            month_ago = now - timedelta(days=30)
+            user = self.db.query(User).filter(User.id == user_id).first()
+            if not user:
+                return None
             
-            # Basic counts
-            total_users = self.db.query(User).count()
-            active_users = self.db.query(User).filter(User.is_active == True).count()
-            verified_users = self.db.query(User).filter(User.is_verified == True).count()
+            # Update fields
+            for field, value in update_data.items():
+                if hasattr(user, field):
+                    setattr(user, field, value)
             
-            # New users
-            new_users_today = self.db.query(User).filter(
-                func.date(User.created_at) == today
-            ).count()
+            user.updated_at = datetime.utcnow()
+            self.db.commit()
+            self.db.refresh(user)
             
-            new_users_week = self.db.query(User).filter(
-                User.created_at >= week_ago
-            ).count()
+            return user
+        
+        except Exception as e:
+            logger.error(f"Error updating user: {str(e)}")
+            self.db.rollback()
+            raise
+    
+    async def delete(self, user_id: int) -> bool:
+        """Delete user."""
+        try:
+            user = self.db.query(User).filter(User.id == user_id).first()
+            if not user:
+                return False
             
-            new_users_month = self.db.query(User).filter(
-                User.created_at >= month_ago
-            ).count()
+            self.db.delete(user)
+            self.db.commit()
+            return True
+        
+        except Exception as e:
+            logger.error(f"Error deleting user: {str(e)}")
+            self.db.rollback()
+            raise
+    
+    async def update_last_login(self, user_id: int) -> None:
+        """Update user last login timestamp."""
+        try:
+            user = self.db.query(User).filter(User.id == user_id).first()
+            if user:
+                user.last_login = datetime.utcnow()
+                self.db.commit()
+        except Exception as e:
+            logger.error(f"Error updating last login: {str(e)}")
+            self.db.rollback()
+            raise
+    
+    async def update_password(self, user_id: int, hashed_password: str) -> None:
+        """Update user password."""
+        try:
+            user = self.db.query(User).filter(User.id == user_id).first()
+            if not user:
+                raise NotFoundException("User not found")
             
-            # Users by country
-            users_by_country = self.db.query(
-                UserProfile.country,
-                func.count(UserProfile.user_id).label('count')
-            ).join(User, UserProfile.user_id == User.id).group_by(
-                UserProfile.country
-            ).filter(UserProfile.country.isnot(None)).all()
+            user.hashed_password = hashed_password
+            user.updated_at = datetime.utcnow()
+            self.db.commit()
+        
+        except Exception as e:
+            logger.error(f"Error updating password: {str(e)}")
+            self.db.rollback()
+            raise
+    
+    async def get_user_profile_data(self, user_id: int) -> Dict[str, Any]:
+        """Get additional user profile data."""
+        try:
+            # This would typically join with orders and other related tables
+            # For now, return mock data
+            return {
+                "order_count": 0,
+                "total_spent": 0.0,
+                "favorite_products": [],
+            }
+        except Exception as e:
+            logger.error(f"Error getting user profile data: {str(e)}")
+            raise
+    
+    def calculate_user_stats_sync(self, user_id: int) -> Dict[str, Any]:
+        """Calculate user statistics (synchronous for thread pool)."""
+        try:
+            # This would typically perform complex calculations
+            # For now, return mock data
+            user = self.db.query(User).filter(User.id == user_id).first()
+            if not user:
+                return {}
             
-            users_by_country_dict = {country: count for country, count in users_by_country}
-            
-            # Activity stats
-            recent_activities = self.db.query(UserActivity).filter(
-                UserActivity.created_at >= week_ago
-            ).count()
-            
-            active_sessions = self.db.query(UserSession).filter(
-                UserSession.is_active == True
-            ).count()
+            # Calculate account age
+            account_age = (datetime.utcnow() - user.created_at).days
             
             return {
-                "total_users": total_users,
-                "active_users": active_users,
-                "verified_users": verified_users,
-                "new_users_today": new_users_today,
-                "new_users_week": new_users_week,
-                "new_users_month": new_users_month,
-                "users_by_country": users_by_country_dict,
-                "activity_stats": {
-                    "recent_activities": recent_activities,
-                    "active_sessions": active_sessions
-                }
+                "total_orders": 0,
+                "total_spent": 0.0,
+                "average_order_value": 0.0,
+                "last_order_date": None,
+                "favorite_category": None,
+                "account_age_days": account_age,
             }
         
         except Exception as e:
-            logger.error(f"Error getting user stats: {str(e)}")
+            logger.error(f"Error calculating user stats: {str(e)}")
             raise
     
-    def bulk_update_users(self, user_ids: List[str], updates: Dict[str, Any]) -> bool:
-        """Bulk update users."""
+    async def get_active_users_count(self) -> int:
+        """Get count of active users."""
         try:
-            self.db.query(User).filter(User.id.in_(user_ids)).update(updates)
-            self.db.commit()
-            
-            logger.info(f"Bulk updated {len(user_ids)} users")
-            return True
-        
+            return self.db.query(User).filter(User.is_active == True).count()
         except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error bulk updating users: {str(e)}")
-            raise ValidationException(f"Failed to bulk update users: {str(e)}")
-    
-    def bulk_delete_users(self, user_ids: List[str]) -> bool:
-        """Bulk delete users."""
-        try:
-            # Delete related records first
-            self.db.query(UserProfile).filter(UserProfile.user_id.in_(user_ids)).delete()
-            self.db.query(UserPreferences).filter(UserPreferences.user_id.in_(user_ids)).delete()
-            self.db.query(UserActivity).filter(UserActivity.user_id.in_(user_ids)).delete()
-            self.db.query(UserSession).filter(UserSession.user_id.in_(user_ids)).delete()
-            
-            # Delete users
-            self.db.query(User).filter(User.id.in_(user_ids)).delete()
-            self.db.commit()
-            
-            logger.info(f"Bulk deleted {len(user_ids)} users")
-            return True
-        
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error bulk deleting users: {str(e)}")
-            raise ValidationException(f"Failed to bulk delete users: {str(e)}")
-
-
-class UserProfileRepository(BaseRepository[UserProfile, UserProfileCreate, UserProfileUpdate]):
-    """User profile repository."""
-    
-    def __init__(self, db: Session):
-        super().__init__(db, UserProfile)
-    
-    def get_by_user_id(self, user_id: str) -> Optional[UserProfile]:
-        """Get user profile by user ID."""
-        try:
-            return self.db.query(UserProfile).filter(UserProfile.user_id == user_id).first()
-        except Exception as e:
-            logger.error(f"Error getting user profile: {str(e)}")
+            logger.error(f"Error getting active users count: {str(e)}")
             raise
     
-    def create_profile(self, user_id: str, profile_data: UserProfileCreate) -> UserProfile:
-        """Create user profile."""
+    async def get_users_by_date_range(
+        self,
+        start_date: date,
+        end_date: date
+    ) -> List[User]:
+        """Get users registered within date range."""
         try:
-            profile = UserProfile(
-                user_id=user_id,
-                **profile_data.dict()
+            return (
+                self.db.query(User)
+                .filter(
+                    and_(
+                        func.date(User.created_at) >= start_date,
+                        func.date(User.created_at) <= end_date,
+                    )
+                )
+                .order_by(desc(User.created_at))
+                .all()
             )
-            
-            self.db.add(profile)
-            self.db.commit()
-            self.db.refresh(profile)
-            
-            logger.info(f"Profile created for user: {user_id}")
-            return profile
-        
         except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error creating user profile: {str(e)}")
-            raise ValidationException(f"Failed to create user profile: {str(e)}")
-    
-    def update_profile(self, user_id: str, profile_data: UserProfileUpdate) -> Optional[UserProfile]:
-        """Update user profile."""
-        try:
-            profile = self.get_by_user_id(user_id)
-            if not profile:
-                # Create profile if it doesn't exist
-                create_data = UserProfileCreate(**profile_data.dict(exclude_unset=True))
-                return self.create_profile(user_id, create_data)
-            
-            # Update existing profile
-            update_data = profile_data.dict(exclude_unset=True)
-            for field, value in update_data.items():
-                if hasattr(profile, field):
-                    setattr(profile, field, value)
-            
-            profile.updated_at = datetime.utcnow()
-            self.db.commit()
-            self.db.refresh(profile)
-            
-            logger.info(f"Profile updated for user: {user_id}")
-            return profile
-        
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error updating user profile: {str(e)}")
-            raise ValidationException(f"Failed to update user profile: {str(e)}")
-
-
-class UserPreferencesRepository(BaseRepository[UserPreferences, UserPreferencesCreate, UserPreferencesUpdate]):
-    """User preferences repository."""
-    
-    def __init__(self, db: Session):
-        super().__init__(db, UserPreferences)
-    
-    def get_by_user_id(self, user_id: str) -> Optional[UserPreferences]:
-        """Get user preferences by user ID."""
-        try:
-            return self.db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
-        except Exception as e:
-            logger.error(f"Error getting user preferences: {str(e)}")
+            logger.error(f"Error getting users by date range: {str(e)}")
             raise
     
-    def create_preferences(self, user_id: str, preferences_data: UserPreferencesCreate) -> UserPreferences:
-        """Create user preferences."""
+    async def search_users(self, search_term: str, limit: int = 10) -> List[User]:
+        """Search users by email or name."""
         try:
-            preferences = UserPreferences(
-                user_id=user_id,
-                **preferences_data.dict()
+            search_pattern = f"%{search_term}%"
+            return (
+                self.db.query(User)
+                .filter(
+                    or_(
+                        User.email.ilike(search_pattern),
+                        User.full_name.ilike(search_pattern),
+                    )
+                )
+                .limit(limit)
+                .all()
             )
-            
-            self.db.add(preferences)
-            self.db.commit()
-            self.db.refresh(preferences)
-            
-            logger.info(f"Preferences created for user: {user_id}")
-            return preferences
-        
         except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error creating user preferences: {str(e)}")
-            raise ValidationException(f"Failed to create user preferences: {str(e)}")
-    
-    def update_preferences(self, user_id: str, preferences_data: UserPreferencesUpdate) -> Optional[UserPreferences]:
-        """Update user preferences."""
-        try:
-            preferences = self.get_by_user_id(user_id)
-            if not preferences:
-                # Create preferences if they don't exist
-                create_data = UserPreferencesCreate(**preferences_data.dict(exclude_unset=True))
-                return self.create_preferences(user_id, create_data)
-            
-            # Update existing preferences
-            update_data = preferences_data.dict(exclude_unset=True)
-            for field, value in update_data.items():
-                if hasattr(preferences, field):
-                    setattr(preferences, field, value)
-            
-            preferences.updated_at = datetime.utcnow()
-            self.db.commit()
-            self.db.refresh(preferences)
-            
-            logger.info(f"Preferences updated for user: {user_id}")
-            return preferences
-        
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error updating user preferences: {str(e)}")
-            raise ValidationException(f"Failed to update user preferences: {str(e)}")
-
-
-class UserActivityRepository(BaseRepository[UserActivity, UserActivityCreate, dict]):
-    """User activity repository."""
-    
-    def __init__(self, db: Session):
-        super().__init__(db, UserActivity)
-    
-    def create_activity(self, user_id: str, activity_data: UserActivityCreate) -> UserActivity:
-        """Create user activity."""
-        try:
-            activity = UserActivity(
-                user_id=user_id,
-                **activity_data.dict()
-            )
-            
-            self.db.add(activity)
-            self.db.commit()
-            self.db.refresh(activity)
-            
-            logger.debug(f"Activity created for user: {user_id}")
-            return activity
-        
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error creating user activity: {str(e)}")
-            raise ValidationException(f"Failed to create user activity: {str(e)}")
-    
-    def get_user_activities(self, user_id: str, skip: int = 0, limit: int = 50) -> List[UserActivity]:
-        """Get user activities."""
-        try:
-            return self.db.query(UserActivity).filter(
-                UserActivity.user_id == user_id
-            ).order_by(UserActivity.created_at.desc()).offset(skip).limit(limit).all()
-        
-        except Exception as e:
-            logger.error(f"Error getting user activities: {str(e)}")
-            raise
-    
-    def get_recent_activities(self, hours: int = 24) -> List[UserActivity]:
-        """Get recent activities."""
-        try:
-            since = datetime.utcnow() - timedelta(hours=hours)
-            return self.db.query(UserActivity).filter(
-                UserActivity.created_at >= since
-            ).order_by(UserActivity.created_at.desc()).all()
-        
-        except Exception as e:
-            logger.error(f"Error getting recent activities: {str(e)}")
-            raise
-
-
-class UserSessionRepository(BaseRepository[UserSession, dict, dict]):
-    """User session repository."""
-    
-    def __init__(self, db: Session):
-        super().__init__(db, UserSession)
-    
-    def create_session(self, user_id: str, session_data: dict) -> UserSession:
-        """Create user session."""
-        try:
-            session = UserSession(
-                user_id=user_id,
-                **session_data
-            )
-            
-            self.db.add(session)
-            self.db.commit()
-            self.db.refresh(session)
-            
-            logger.debug(f"Session created for user: {user_id}")
-            return session
-        
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error creating user session: {str(e)}")
-            raise ValidationException(f"Failed to create user session: {str(e)}")
-    
-    def get_user_sessions(self, user_id: str, active_only: bool = True) -> List[UserSession]:
-        """Get user sessions."""
-        try:
-            query = self.db.query(UserSession).filter(UserSession.user_id == user_id)
-            
-            if active_only:
-                query = query.filter(UserSession.is_active == True)
-            
-            return query.order_by(UserSession.last_activity.desc()).all()
-        
-        except Exception as e:
-            logger.error(f"Error getting user sessions: {str(e)}")
-            raise
-    
-    def update_session_activity(self, session_id: str) -> bool:
-        """Update session last activity."""
-        try:
-            session = self.get(session_id)
-            if session:
-                session.last_activity = datetime.utcnow()
-                self.db.commit()
-                return True
-            return False
-        
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error updating session activity: {str(e)}")
-            raise
-    
-    def deactivate_session(self, session_id: str) -> bool:
-        """Deactivate session."""
-        try:
-            session = self.get(session_id)
-            if session:
-                session.is_active = False
-                self.db.commit()
-                return True
-            return False
-        
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error deactivating session: {str(e)}")
-            raise
-    
-    def cleanup_expired_sessions(self) -> int:
-        """Clean up expired sessions."""
-        try:
-            now = datetime.utcnow()
-            count = self.db.query(UserSession).filter(
-                UserSession.expires_at < now
-            ).update({"is_active": False})
-            
-            self.db.commit()
-            
-            logger.info(f"Cleaned up {count} expired sessions")
-            return count
-        
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error cleaning up expired sessions: {str(e)}")
+            logger.error(f"Error searching users: {str(e)}")
             raise

@@ -1,286 +1,119 @@
 """
-Custom exceptions and error handling
+Custom exception classes and error handling.
 """
-
-import logging
-from typing import Any, Dict, Optional, Union
-from fastapi import HTTPException, Request
+from typing import Any, Dict, Optional
+from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from pydantic import ValidationError
-import traceback
+import logging
 
-from app.core.config import get_settings
-
-settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
-class BaseAPIException(Exception):
-    """
-    Base exception class for API errors
-    """
+class BaseCustomException(Exception):
+    """Base custom exception class."""
     
     def __init__(
         self,
         message: str,
-        status_code: int = 500,
-        error_code: Optional[str] = None,
+        status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR,
         details: Optional[Dict[str, Any]] = None,
     ):
         self.message = message
         self.status_code = status_code
-        self.error_code = error_code or self.__class__.__name__
         self.details = details or {}
         super().__init__(self.message)
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert exception to dictionary
-        """
-        return {
-            "error": True,
-            "error_code": self.error_code,
-            "message": self.message,
-            "details": self.details,
-            "status_code": self.status_code,
-        }
 
 
-class ValidationException(BaseAPIException):
-    """
-    Validation error exception
-    """
+class ValidationException(BaseCustomException):
+    """Validation error exception."""
     
-    def __init__(
-        self,
-        message: str = "Validation failed",
-        field_errors: Optional[Dict[str, str]] = None,
-        details: Optional[Dict[str, Any]] = None,
-    ):
-        self.field_errors = field_errors or {}
-        combined_details = {"field_errors": self.field_errors}
-        if details:
-            combined_details.update(details)
-        
+    def __init__(self, message: str, details: Optional[Dict[str, Any]] = None):
         super().__init__(
             message=message,
-            status_code=422,
-            error_code="VALIDATION_ERROR",
-            details=combined_details,
-        )
-
-
-class AuthenticationException(BaseAPIException):
-    """
-    Authentication error exception
-    """
-    
-    def __init__(
-        self,
-        message: str = "Authentication failed",
-        details: Optional[Dict[str, Any]] = None,
-    ):
-        super().__init__(
-            message=message,
-            status_code=401,
-            error_code="AUTHENTICATION_ERROR",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             details=details,
         )
 
 
-class AuthorizationException(BaseAPIException):
-    """
-    Authorization error exception
-    """
+class AuthenticationException(BaseCustomException):
+    """Authentication error exception."""
     
-    def __init__(
-        self,
-        message: str = "Access denied",
-        details: Optional[Dict[str, Any]] = None,
-    ):
+    def __init__(self, message: str = "Authentication failed"):
         super().__init__(
             message=message,
-            status_code=403,
-            error_code="AUTHORIZATION_ERROR",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+
+class AuthorizationException(BaseCustomException):
+    """Authorization error exception."""
+    
+    def __init__(self, message: str = "Access denied"):
+        super().__init__(
+            message=message,
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class NotFoundException(BaseCustomException):
+    """Resource not found exception."""
+    
+    def __init__(self, message: str = "Resource not found"):
+        super().__init__(
+            message=message,
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class ConflictException(BaseCustomException):
+    """Resource conflict exception."""
+    
+    def __init__(self, message: str = "Resource conflict"):
+        super().__init__(
+            message=message,
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class BusinessLogicException(BaseCustomException):
+    """Business logic error exception."""
+    
+    def __init__(self, message: str, details: Optional[Dict[str, Any]] = None):
+        super().__init__(
+            message=message,
+            status_code=status.HTTP_400_BAD_REQUEST,
             details=details,
         )
 
 
-class NotFoundException(BaseAPIException):
-    """
-    Resource not found exception
-    """
+class ExternalServiceException(BaseCustomException):
+    """External service error exception."""
     
-    def __init__(
-        self,
-        message: str = "Resource not found",
-        resource_type: Optional[str] = None,
-        resource_id: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None,
-    ):
-        combined_details = {}
-        if resource_type:
-            combined_details["resource_type"] = resource_type
-        if resource_id:
-            combined_details["resource_id"] = resource_id
-        if details:
-            combined_details.update(details)
-        
+    def __init__(self, message: str, service_name: str):
         super().__init__(
             message=message,
-            status_code=404,
-            error_code="NOT_FOUND",
-            details=combined_details,
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            details={"service": service_name},
         )
 
 
-class ConflictException(BaseAPIException):
-    """
-    Conflict error exception
-    """
+class RateLimitException(BaseCustomException):
+    """Rate limit exceeded exception."""
     
-    def __init__(
-        self,
-        message: str = "Resource conflict",
-        details: Optional[Dict[str, Any]] = None,
-    ):
+    def __init__(self, message: str = "Rate limit exceeded"):
         super().__init__(
             message=message,
-            status_code=409,
-            error_code="CONFLICT_ERROR",
-            details=details,
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
         )
 
 
-class BusinessLogicException(BaseAPIException):
-    """
-    Business logic error exception
-    """
-    
-    def __init__(
-        self,
-        message: str = "Business logic error",
-        details: Optional[Dict[str, Any]] = None,
-    ):
-        super().__init__(
-            message=message,
-            status_code=400,
-            error_code="BUSINESS_LOGIC_ERROR",
-            details=details,
-        )
-
-
-class ExternalServiceException(BaseAPIException):
-    """
-    External service error exception
-    """
-    
-    def __init__(
-        self,
-        message: str = "External service error",
-        service_name: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None,
-    ):
-        combined_details = {}
-        if service_name:
-            combined_details["service_name"] = service_name
-        if details:
-            combined_details.update(details)
-        
-        super().__init__(
-            message=message,
-            status_code=502,
-            error_code="EXTERNAL_SERVICE_ERROR",
-            details=combined_details,
-        )
-
-
-class RateLimitException(BaseAPIException):
-    """
-    Rate limit exceeded exception
-    """
-    
-    def __init__(
-        self,
-        message: str = "Rate limit exceeded",
-        retry_after: Optional[int] = None,
-        details: Optional[Dict[str, Any]] = None,
-    ):
-        combined_details = {}
-        if retry_after:
-            combined_details["retry_after"] = retry_after
-        if details:
-            combined_details.update(details)
-        
-        super().__init__(
-            message=message,
-            status_code=429,
-            error_code="RATE_LIMIT_EXCEEDED",
-            details=combined_details,
-        )
-
-
-class DatabaseException(BaseAPIException):
-    """
-    Database error exception
-    """
-    
-    def __init__(
-        self,
-        message: str = "Database error",
-        operation: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None,
-    ):
-        combined_details = {}
-        if operation:
-            combined_details["operation"] = operation
-        if details:
-            combined_details.update(details)
-        
-        super().__init__(
-            message=message,
-            status_code=500,
-            error_code="DATABASE_ERROR",
-            details=combined_details,
-        )
-
-
-class FileUploadException(BaseAPIException):
-    """
-    File upload error exception
-    """
-    
-    def __init__(
-        self,
-        message: str = "File upload error",
-        file_name: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None,
-    ):
-        combined_details = {}
-        if file_name:
-            combined_details["file_name"] = file_name
-        if details:
-            combined_details.update(details)
-        
-        super().__init__(
-            message=message,
-            status_code=400,
-            error_code="FILE_UPLOAD_ERROR",
-            details=combined_details,
-        )
-
-
-# Exception handlers
-async def base_api_exception_handler(request: Request, exc: BaseAPIException):
-    """
-    Handler for BaseAPIException and its subclasses
-    """
+async def custom_exception_handler(request: Request, exc: BaseCustomException):
+    """Handle custom exceptions."""
     logger.error(
-        f"API Exception: {exc.error_code} - {exc.message}",
+        f"Custom exception occurred: {exc.message}",
         extra={
-            "error_code": exc.error_code,
             "status_code": exc.status_code,
             "details": exc.details,
             "path": request.url.path,
@@ -290,19 +123,22 @@ async def base_api_exception_handler(request: Request, exc: BaseAPIException):
     
     return JSONResponse(
         status_code=exc.status_code,
-        content=exc.to_dict(),
+        content={
+            "error": {
+                "message": exc.message,
+                "code": exc.status_code,
+                "details": exc.details,
+            }
+        },
     )
 
 
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """
-    Handler for HTTPException
-    """
+    """Handle HTTP exceptions."""
     logger.error(
-        f"HTTP Exception: {exc.status_code} - {exc.detail}",
+        f"HTTP exception occurred: {exc.detail}",
         extra={
             "status_code": exc.status_code,
-            "detail": exc.detail,
             "path": request.url.path,
             "method": request.method,
         },
@@ -311,97 +147,64 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content={
-            "error": True,
-            "error_code": "HTTP_ERROR",
-            "message": exc.detail,
-            "details": {},
-            "status_code": exc.status_code,
+            "error": {
+                "message": exc.detail,
+                "code": exc.status_code,
+            }
         },
     )
 
 
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """
-    Handler for RequestValidationError
-    """
-    field_errors = {}
-    
-    for error in exc.errors():
-        field_name = ".".join(str(loc) for loc in error["loc"])
-        field_errors[field_name] = error["msg"]
-    
+    """Handle validation exceptions."""
     logger.error(
-        f"Validation Exception: {field_errors}",
+        f"Validation error occurred: {exc.errors()}",
         extra={
-            "field_errors": field_errors,
             "path": request.url.path,
             "method": request.method,
+            "errors": exc.errors(),
         },
     )
     
     return JSONResponse(
-        status_code=422,
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
-            "error": True,
-            "error_code": "VALIDATION_ERROR",
-            "message": "Validation failed",
-            "details": {"field_errors": field_errors},
-            "status_code": 422,
+            "error": {
+                "message": "Validation error",
+                "code": status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "details": exc.errors(),
+            }
         },
     )
 
 
-async def generic_exception_handler(request: Request, exc: Exception):
-    """
-    Handler for generic exceptions
-    """
-    error_id = id(exc)
-    
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle general exceptions."""
     logger.error(
-        f"Unhandled Exception [{error_id}]: {type(exc).__name__} - {str(exc)}",
+        f"Unexpected error occurred: {str(exc)}",
         extra={
-            "error_id": error_id,
-            "error_type": type(exc).__name__,
             "path": request.url.path,
             "method": request.method,
-            "traceback": traceback.format_exc(),
+            "exception_type": type(exc).__name__,
         },
         exc_info=True,
     )
     
-    # Don't expose internal errors in production
-    if settings.ENVIRONMENT == "production":
-        message = "Internal server error"
-        details = {"error_id": error_id}
-    else:
-        message = str(exc)
-        details = {
-            "error_id": error_id,
-            "error_type": type(exc).__name__,
-            "traceback": traceback.format_exc(),
-        }
-    
     return JSONResponse(
-        status_code=500,
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
-            "error": True,
-            "error_code": "INTERNAL_ERROR",
-            "message": message,
-            "details": details,
-            "status_code": 500,
+            "error": {
+                "message": "Internal server error",
+                "code": status.HTTP_500_INTERNAL_SERVER_ERROR,
+            }
         },
     )
 
 
-def setup_exception_handlers(app):
-    """
-    Setup exception handlers for the FastAPI app
-    """
-    app.add_exception_handler(BaseAPIException, base_api_exception_handler)
+def setup_exception_handlers(app: FastAPI):
+    """Setup exception handlers for the application."""
+    app.add_exception_handler(BaseCustomException, custom_exception_handler)
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
-    app.add_exception_handler(ValidationError, validation_exception_handler)
-    app.add_exception_handler(Exception, generic_exception_handler)
-    
-    logger.info("Exception handlers registered")
+    app.add_exception_handler(Exception, general_exception_handler)

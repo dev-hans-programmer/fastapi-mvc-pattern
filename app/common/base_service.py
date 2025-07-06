@@ -1,264 +1,256 @@
 """
-Base service class for business logic
+Base service class for business logic layer
 """
-import logging
-from abc import ABC, abstractmethod
-from typing import Any, Dict, Generic, List, Optional, Type, TypeVar, Union
-from pydantic import BaseModel
 
-from app.common.base_repository import BaseRepository
-from app.core.exceptions import ValidationException, BusinessLogicException
-from app.core.decorators import log_execution_time, retry
+import logging
+from typing import Any, Dict, List, Optional
+from abc import ABC
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-# Type variables for generic service
-ModelType = TypeVar("ModelType")
-CreateSchemaType = TypeVar("CreateSchemaType", bound=BaseModel)
-UpdateSchemaType = TypeVar("UpdateSchemaType", bound=BaseModel)
-RepositoryType = TypeVar("RepositoryType", bound=BaseRepository)
 
-
-class BaseService(ABC, Generic[ModelType, CreateSchemaType, UpdateSchemaType, RepositoryType]):
-    """Base service class with common business logic operations."""
+class BaseService(ABC):
+    """
+    Base service class providing common business logic operations
+    """
     
-    def __init__(self, repository: RepositoryType):
-        self.repository = repository
+    def __init__(self):
+        self.logger = logging.getLogger(self.__class__.__name__)
     
-    @log_execution_time
-    def create(self, obj_in: CreateSchemaType) -> ModelType:
-        """Create a new entity with business logic validation."""
-        try:
-            # Pre-creation validation
-            self._validate_create(obj_in)
-            
-            # Create the entity
-            entity = self.repository.create(obj_in)
-            
-            # Post-creation processing
-            self._post_create(entity)
-            
-            logger.info(f"Successfully created {entity.__class__.__name__} with ID: {entity.id}")
-            return entity
+    def validate_required_fields(self, data: Dict[str, Any], required_fields: List[str]) -> None:
+        """
+        Validate that all required fields are present and not empty
+        """
+        missing_fields = []
+        empty_fields = []
         
-        except Exception as e:
-            logger.error(f"Failed to create entity: {str(e)}")
-            raise
-    
-    @log_execution_time
-    def get_by_id(self, id: Any) -> Optional[ModelType]:
-        """Get an entity by ID with business logic."""
-        try:
-            entity = self.repository.get_by_id(id)
-            
-            # Post-retrieval processing
-            self._post_get(entity)
-            
-            return entity
-        
-        except Exception as e:
-            logger.error(f"Failed to get entity by ID {id}: {str(e)}")
-            raise
-    
-    @log_execution_time
-    def get_multi(
-        self,
-        skip: int = 0,
-        limit: int = 100,
-        filters: Optional[Dict[str, Any]] = None,
-        order_by: Optional[str] = None,
-        order_desc: bool = False
-    ) -> List[ModelType]:
-        """Get multiple entities with business logic filtering."""
-        try:
-            # Apply business logic filters
-            business_filters = self._apply_business_filters(filters)
-            
-            entities = self.repository.get_multi(
-                skip=skip,
-                limit=limit,
-                filters=business_filters,
-                order_by=order_by,
-                order_desc=order_desc
-            )
-            
-            # Post-retrieval processing for each entity
-            for entity in entities:
-                self._post_get(entity)
-            
-            return entities
-        
-        except Exception as e:
-            logger.error(f"Failed to get multiple entities: {str(e)}")
-            raise
-    
-    @log_execution_time
-    def update(self, id: Any, obj_in: Union[UpdateSchemaType, Dict[str, Any]]) -> ModelType:
-        """Update an entity with business logic validation."""
-        try:
-            # Get existing entity
-            existing_entity = self.repository.get_by_id(id)
-            
-            # Pre-update validation
-            self._validate_update(existing_entity, obj_in)
-            
-            # Update the entity
-            updated_entity = self.repository.update(id, obj_in)
-            
-            # Post-update processing
-            self._post_update(existing_entity, updated_entity)
-            
-            logger.info(f"Successfully updated {updated_entity.__class__.__name__} with ID: {id}")
-            return updated_entity
-        
-        except Exception as e:
-            logger.error(f"Failed to update entity with ID {id}: {str(e)}")
-            raise
-    
-    @log_execution_time
-    def delete(self, id: Any) -> bool:
-        """Delete an entity with business logic validation."""
-        try:
-            # Get existing entity
-            existing_entity = self.repository.get_by_id(id)
-            
-            # Pre-delete validation
-            self._validate_delete(existing_entity)
-            
-            # Delete the entity
-            success = self.repository.delete(id)
-            
-            # Post-delete processing
-            self._post_delete(existing_entity)
-            
-            logger.info(f"Successfully deleted {existing_entity.__class__.__name__} with ID: {id}")
-            return success
-        
-        except Exception as e:
-            logger.error(f"Failed to delete entity with ID {id}: {str(e)}")
-            raise
-    
-    def count(self, filters: Optional[Dict[str, Any]] = None) -> int:
-        """Count entities with business logic filtering."""
-        try:
-            business_filters = self._apply_business_filters(filters)
-            return self.repository.count(business_filters)
-        
-        except Exception as e:
-            logger.error(f"Failed to count entities: {str(e)}")
-            raise
-    
-    def exists(self, id: Any) -> bool:
-        """Check if an entity exists."""
-        try:
-            return self.repository.exists(id)
-        
-        except Exception as e:
-            logger.error(f"Failed to check existence of entity with ID {id}: {str(e)}")
-            raise
-    
-    @log_execution_time
-    def bulk_create(self, objects: List[CreateSchemaType]) -> List[ModelType]:
-        """Create multiple entities with business logic validation."""
-        try:
-            # Validate all objects
-            for obj_in in objects:
-                self._validate_create(obj_in)
-            
-            # Create entities
-            entities = self.repository.bulk_create(objects)
-            
-            # Post-creation processing
-            for entity in entities:
-                self._post_create(entity)
-            
-            logger.info(f"Successfully bulk created {len(entities)} entities")
-            return entities
-        
-        except Exception as e:
-            logger.error(f"Failed to bulk create entities: {str(e)}")
-            raise
-    
-    def search(self, query: str, fields: List[str]) -> List[ModelType]:
-        """Search entities with business logic."""
-        try:
-            entities = self.repository.search(query, fields)
-            
-            # Post-retrieval processing
-            for entity in entities:
-                self._post_get(entity)
-            
-            return entities
-        
-        except Exception as e:
-            logger.error(f"Failed to search entities: {str(e)}")
-            raise
-    
-    # Abstract methods for business logic customization
-    def _validate_create(self, obj_in: CreateSchemaType) -> None:
-        """Validate object before creation. Override in subclasses."""
-        pass
-    
-    def _validate_update(self, existing_entity: ModelType, obj_in: Union[UpdateSchemaType, Dict[str, Any]]) -> None:
-        """Validate object before update. Override in subclasses."""
-        pass
-    
-    def _validate_delete(self, existing_entity: ModelType) -> None:
-        """Validate object before deletion. Override in subclasses."""
-        pass
-    
-    def _post_create(self, entity: ModelType) -> None:
-        """Post-creation processing. Override in subclasses."""
-        pass
-    
-    def _post_get(self, entity: ModelType) -> None:
-        """Post-retrieval processing. Override in subclasses."""
-        pass
-    
-    def _post_update(self, old_entity: ModelType, new_entity: ModelType) -> None:
-        """Post-update processing. Override in subclasses."""
-        pass
-    
-    def _post_delete(self, entity: ModelType) -> None:
-        """Post-deletion processing. Override in subclasses."""
-        pass
-    
-    def _apply_business_filters(self, filters: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Apply business logic filters. Override in subclasses."""
-        return filters
-    
-    # Utility methods
-    def _validate_required_fields(self, obj: Dict[str, Any], required_fields: List[str]) -> None:
-        """Validate that required fields are present and not empty."""
         for field in required_fields:
-            if field not in obj or obj[field] is None:
-                raise ValidationException(f"Field '{field}' is required")
+            if field not in data:
+                missing_fields.append(field)
+            elif data[field] is None or (isinstance(data[field], str) and not data[field].strip()):
+                empty_fields.append(field)
+        
+        if missing_fields:
+            raise ValueError(f"Missing required fields: {', '.join(missing_fields)}")
+        
+        if empty_fields:
+            raise ValueError(f"Empty required fields: {', '.join(empty_fields)}")
+    
+    def validate_field_types(self, data: Dict[str, Any], field_types: Dict[str, type]) -> None:
+        """
+        Validate field types
+        """
+        invalid_fields = []
+        
+        for field, expected_type in field_types.items():
+            if field in data and data[field] is not None:
+                if not isinstance(data[field], expected_type):
+                    invalid_fields.append(f"{field} (expected {expected_type.__name__}, got {type(data[field]).__name__})")
+        
+        if invalid_fields:
+            raise TypeError(f"Invalid field types: {', '.join(invalid_fields)}")
+    
+    def sanitize_string_fields(self, data: Dict[str, Any], string_fields: List[str]) -> Dict[str, Any]:
+        """
+        Sanitize string fields by stripping whitespace
+        """
+        sanitized_data = data.copy()
+        
+        for field in string_fields:
+            if field in sanitized_data and isinstance(sanitized_data[field], str):
+                sanitized_data[field] = sanitized_data[field].strip()
+        
+        return sanitized_data
+    
+    def normalize_email(self, email: str) -> str:
+        """
+        Normalize email address
+        """
+        if not email:
+            return email
+        
+        return email.strip().lower()
+    
+    def validate_pagination_params(self, page: int, limit: int, max_limit: int = 1000) -> tuple:
+        """
+        Validate and normalize pagination parameters
+        """
+        # Ensure page is at least 1
+        page = max(1, page)
+        
+        # Ensure limit is within bounds
+        limit = max(1, min(limit, max_limit))
+        
+        # Calculate offset
+        offset = (page - 1) * limit
+        
+        return page, limit, offset
+    
+    def validate_sort_params(self, sort_by: Optional[str], sort_order: str, allowed_fields: List[str]) -> tuple:
+        """
+        Validate sorting parameters
+        """
+        # Validate sort field
+        if sort_by and sort_by not in allowed_fields:
+            raise ValueError(f"Invalid sort field: {sort_by}. Allowed fields: {', '.join(allowed_fields)}")
+        
+        # Validate sort order
+        if sort_order.lower() not in ["asc", "desc"]:
+            sort_order = "asc"
+        
+        return sort_by, sort_order.lower()
+    
+    def apply_date_filters(self, filters: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Apply date range filters
+        """
+        processed_filters = filters.copy()
+        
+        # Handle date ranges
+        if "date_from" in filters and "date_to" in filters:
+            date_from = filters["date_from"]
+            date_to = filters["date_to"]
             
-            if isinstance(obj[field], str) and not obj[field].strip():
-                raise ValidationException(f"Field '{field}' cannot be empty")
+            if isinstance(date_from, str):
+                date_from = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+            if isinstance(date_to, str):
+                date_to = datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+            
+            processed_filters["created_at"] = {
+                "gte": date_from,
+                "lte": date_to,
+            }
+            
+            # Remove original filters
+            processed_filters.pop("date_from", None)
+            processed_filters.pop("date_to", None)
+        
+        return processed_filters
     
-    def _validate_unique_fields(self, obj: Dict[str, Any], unique_fields: List[str], exclude_id: Optional[Any] = None) -> None:
-        """Validate that unique fields don't conflict with existing records."""
-        for field in unique_fields:
-            if field in obj and obj[field] is not None:
-                filters = {field: obj[field]}
-                existing = self.repository.get_multi(filters=filters)
-                
-                if existing:
-                    # If updating, exclude the current record
-                    if exclude_id is not None:
-                        existing = [e for e in existing if e.id != exclude_id]
-                    
-                    if existing:
-                        raise ValidationException(f"Value '{obj[field]}' for field '{field}' already exists")
+    def build_search_filters(self, query: str, search_fields: List[str]) -> Dict[str, Any]:
+        """
+        Build search filters for text search
+        """
+        if not query or not search_fields:
+            return {}
+        
+        # For now, we'll use simple LIKE search
+        # In production, you might want to use full-text search
+        search_filters = {}
+        for field in search_fields:
+            search_filters[field] = {"like": query}
+        
+        return search_filters
     
-    def _validate_enum_fields(self, obj: Dict[str, Any], enum_fields: Dict[str, List[str]]) -> None:
-        """Validate that enum fields have valid values."""
-        for field, valid_values in enum_fields.items():
-            if field in obj and obj[field] is not None:
-                if obj[field] not in valid_values:
-                    raise ValidationException(f"Invalid value '{obj[field]}' for field '{field}'. Valid values are: {valid_values}")
+    def log_operation(self, operation: str, entity_type: str, entity_id: Optional[str] = None, 
+                     user_id: Optional[str] = None, extra_data: Optional[Dict[str, Any]] = None):
+        """
+        Log business operation
+        """
+        log_data = {
+            "operation": operation,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "user_id": user_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        
+        if extra_data:
+            log_data.update(extra_data)
+        
+        self.logger.info(f"Operation: {operation}", extra=log_data)
     
-    def _validate_business_rules(self, obj: Dict[str, Any], entity: Optional[ModelType] = None) -> None:
-        """Validate business rules. Override in subclasses."""
+    def calculate_pagination_info(self, total: int, page: int, limit: int) -> Dict[str, Any]:
+        """
+        Calculate pagination information
+        """
+        total_pages = (total + limit - 1) // limit  # Ceiling division
+        has_next = page < total_pages
+        has_prev = page > 1
+        
+        return {
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages,
+            "has_next": has_next,
+            "has_prev": has_prev,
+            "next_page": page + 1 if has_next else None,
+            "prev_page": page - 1 if has_prev else None,
+        }
+    
+    def format_response(self, data: Any, pagination: Optional[Dict[str, Any]] = None, 
+                       meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Format service response with consistent structure
+        """
+        response = {
+            "data": data,
+            "success": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        
+        if pagination:
+            response["pagination"] = pagination
+        
+        if meta:
+            response["meta"] = meta
+        
+        return response
+    
+    def format_error_response(self, error: str, error_code: Optional[str] = None, 
+                            details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Format error response with consistent structure
+        """
+        response = {
+            "data": None,
+            "success": False,
+            "error": error,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        
+        if error_code:
+            response["error_code"] = error_code
+        
+        if details:
+            response["details"] = details
+        
+        return response
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """
+        Service health check
+        """
+        return {
+            "service": self.__class__.__name__,
+            "status": "healthy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    
+    def __enter__(self):
+        """
+        Context manager entry
+        """
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Context manager exit
+        """
+        # Clean up resources if needed
+        pass
+    
+    async def __aenter__(self):
+        """
+        Async context manager entry
+        """
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """
+        Async context manager exit
+        """
+        # Clean up resources if needed
         pass

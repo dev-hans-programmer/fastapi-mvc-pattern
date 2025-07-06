@@ -1,32 +1,84 @@
 """
 Common decorators for the application
 """
+
 import asyncio
 import functools
 import logging
 import time
 from typing import Any, Callable, Dict, Optional
-from fastapi import HTTPException, status
+from datetime import datetime, timezone
 
-from app.core.exceptions import RateLimitError, ValidationError
-from app.core.security import SecurityUtils
+from app.core.exceptions import BaseAPIException
+from app.core.logging import log_error, log_execution_time
 
 logger = logging.getLogger(__name__)
 
 
-def timer(func: Callable) -> Callable:
-    """Decorator to measure execution time"""
+def handle_exceptions(func: Callable) -> Callable:
+    """
+    Decorator to handle exceptions in controller methods
+    """
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except BaseAPIException:
+            # Re-raise API exceptions as-is
+            raise
+        except Exception as e:
+            # Log unexpected exceptions
+            log_error(e, context={
+                "function": func.__name__,
+                "module": func.__module__,
+                "args": str(args),
+                "kwargs": str(kwargs),
+            })
+            # Convert to generic API exception
+            raise BaseAPIException(
+                message="An unexpected error occurred",
+                status_code=500,
+                error_code="INTERNAL_ERROR",
+                details={"original_error": str(e)}
+            )
+    
+    return wrapper
+
+
+def log_execution_time(func: Callable) -> Callable:
+    """
+    Decorator to log execution time of functions
+    """
     @functools.wraps(func)
     async def async_wrapper(*args, **kwargs):
         start_time = time.time()
         try:
             result = await func(*args, **kwargs)
-            execution_time = time.time() - start_time
-            logger.info(f"{func.__name__} executed in {execution_time:.4f} seconds")
+            duration = time.time() - start_time
+            log_execution_time(
+                function_name=func.__name__,
+                duration=duration,
+                success=True,
+                extra={
+                    "module": func.__module__,
+                    "args_count": len(args),
+                    "kwargs_count": len(kwargs),
+                }
+            )
             return result
         except Exception as e:
-            execution_time = time.time() - start_time
-            logger.error(f"{func.__name__} failed after {execution_time:.4f} seconds: {e}")
+            duration = time.time() - start_time
+            log_execution_time(
+                function_name=func.__name__,
+                duration=duration,
+                success=False,
+                extra={
+                    "module": func.__module__,
+                    "error": str(e),
+                    "args_count": len(args),
+                    "kwargs_count": len(kwargs),
+                }
+            )
             raise
     
     @functools.wraps(func)
@@ -34,99 +86,185 @@ def timer(func: Callable) -> Callable:
         start_time = time.time()
         try:
             result = func(*args, **kwargs)
-            execution_time = time.time() - start_time
-            logger.info(f"{func.__name__} executed in {execution_time:.4f} seconds")
+            duration = time.time() - start_time
+            log_execution_time(
+                function_name=func.__name__,
+                duration=duration,
+                success=True,
+                extra={
+                    "module": func.__module__,
+                    "args_count": len(args),
+                    "kwargs_count": len(kwargs),
+                }
+            )
             return result
         except Exception as e:
-            execution_time = time.time() - start_time
-            logger.error(f"{func.__name__} failed after {execution_time:.4f} seconds: {e}")
+            duration = time.time() - start_time
+            log_execution_time(
+                function_name=func.__name__,
+                duration=duration,
+                success=False,
+                extra={
+                    "module": func.__module__,
+                    "error": str(e),
+                    "args_count": len(args),
+                    "kwargs_count": len(kwargs),
+                }
+            )
             raise
     
     return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
 
 
-def retry(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0):
-    """Decorator for retrying failed operations"""
+def retry(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0, 
+          exceptions: tuple = (Exception,)) -> Callable:
+    """
+    Decorator to retry function execution on failure
+    """
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         async def async_wrapper(*args, **kwargs):
+            current_delay = delay
+            last_exception = None
+            
             for attempt in range(max_attempts):
                 try:
                     return await func(*args, **kwargs)
-                except Exception as e:
+                except exceptions as e:
+                    last_exception = e
                     if attempt == max_attempts - 1:
-                        logger.error(f"{func.__name__} failed after {max_attempts} attempts: {e}")
+                        # Last attempt failed
+                        logger.error(
+                            f"Function {func.__name__} failed after {max_attempts} attempts: {e}",
+                            extra={
+                                "function": func.__name__,
+                                "attempts": max_attempts,
+                                "final_error": str(e),
+                            }
+                        )
                         raise
                     
-                    wait_time = delay * (backoff ** attempt)
-                    logger.warning(f"{func.__name__} failed (attempt {attempt + 1}), retrying in {wait_time}s: {e}")
-                    await asyncio.sleep(wait_time)
+                    logger.warning(
+                        f"Function {func.__name__} failed on attempt {attempt + 1}: {e}. Retrying in {current_delay}s",
+                        extra={
+                            "function": func.__name__,
+                            "attempt": attempt + 1,
+                            "max_attempts": max_attempts,
+                            "delay": current_delay,
+                            "error": str(e),
+                        }
+                    )
+                    
+                    await asyncio.sleep(current_delay)
+                    current_delay *= backoff
+            
+            # This should never be reached
+            raise last_exception
         
         @functools.wraps(func)
         def sync_wrapper(*args, **kwargs):
+            import time as sync_time
+            
+            current_delay = delay
+            last_exception = None
+            
             for attempt in range(max_attempts):
                 try:
                     return func(*args, **kwargs)
-                except Exception as e:
+                except exceptions as e:
+                    last_exception = e
                     if attempt == max_attempts - 1:
-                        logger.error(f"{func.__name__} failed after {max_attempts} attempts: {e}")
+                        # Last attempt failed
+                        logger.error(
+                            f"Function {func.__name__} failed after {max_attempts} attempts: {e}",
+                            extra={
+                                "function": func.__name__,
+                                "attempts": max_attempts,
+                                "final_error": str(e),
+                            }
+                        )
                         raise
                     
-                    wait_time = delay * (backoff ** attempt)
-                    logger.warning(f"{func.__name__} failed (attempt {attempt + 1}), retrying in {wait_time}s: {e}")
-                    time.sleep(wait_time)
+                    logger.warning(
+                        f"Function {func.__name__} failed on attempt {attempt + 1}: {e}. Retrying in {current_delay}s",
+                        extra={
+                            "function": func.__name__,
+                            "attempt": attempt + 1,
+                            "max_attempts": max_attempts,
+                            "delay": current_delay,
+                            "error": str(e),
+                        }
+                    )
+                    
+                    sync_time.sleep(current_delay)
+                    current_delay *= backoff
+            
+            # This should never be reached
+            raise last_exception
         
         return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
     
     return decorator
 
 
-def cache(ttl: int = 300):
-    """Simple in-memory caching decorator"""
+def cache_result(ttl: int = 300, key_prefix: Optional[str] = None) -> Callable:
+    """
+    Decorator to cache function results
+    """
     def decorator(func: Callable) -> Callable:
-        cache_storage = {}
+        cache = {}
+        cache_times = {}
+        
+        def generate_cache_key(*args, **kwargs) -> str:
+            """Generate cache key from function arguments"""
+            key_parts = [key_prefix or func.__name__]
+            key_parts.extend(str(arg) for arg in args)
+            key_parts.extend(f"{k}={v}" for k, v in sorted(kwargs.items()))
+            return ":".join(key_parts)
+        
+        def is_cache_valid(cache_key: str) -> bool:
+            """Check if cache entry is still valid"""
+            if cache_key not in cache_times:
+                return False
+            return time.time() - cache_times[cache_key] < ttl
         
         @functools.wraps(func)
         async def async_wrapper(*args, **kwargs):
-            # Create cache key
-            cache_key = f"{func.__name__}:{hash(str(args) + str(kwargs))}"
-            current_time = time.time()
+            cache_key = generate_cache_key(*args, **kwargs)
             
             # Check cache
-            if cache_key in cache_storage:
-                cached_result, timestamp = cache_storage[cache_key]
-                if current_time - timestamp < ttl:
-                    logger.debug(f"Cache hit for {func.__name__}")
-                    return cached_result
+            if cache_key in cache and is_cache_valid(cache_key):
+                logger.debug(f"Cache hit for {func.__name__}: {cache_key}")
+                return cache[cache_key]
             
             # Execute function
             result = await func(*args, **kwargs)
             
             # Store in cache
-            cache_storage[cache_key] = (result, current_time)
-            logger.debug(f"Cached result for {func.__name__}")
+            cache[cache_key] = result
+            cache_times[cache_key] = time.time()
+            
+            logger.debug(f"Cache miss for {func.__name__}: {cache_key}")
             
             return result
         
         @functools.wraps(func)
         def sync_wrapper(*args, **kwargs):
-            # Create cache key
-            cache_key = f"{func.__name__}:{hash(str(args) + str(kwargs))}"
-            current_time = time.time()
+            cache_key = generate_cache_key(*args, **kwargs)
             
             # Check cache
-            if cache_key in cache_storage:
-                cached_result, timestamp = cache_storage[cache_key]
-                if current_time - timestamp < ttl:
-                    logger.debug(f"Cache hit for {func.__name__}")
-                    return cached_result
+            if cache_key in cache and is_cache_valid(cache_key):
+                logger.debug(f"Cache hit for {func.__name__}: {cache_key}")
+                return cache[cache_key]
             
             # Execute function
             result = func(*args, **kwargs)
             
             # Store in cache
-            cache_storage[cache_key] = (result, current_time)
-            logger.debug(f"Cached result for {func.__name__}")
+            cache[cache_key] = result
+            cache_times[cache_key] = time.time()
+            
+            logger.debug(f"Cache miss for {func.__name__}: {cache_key}")
             
             return result
         
@@ -135,56 +273,30 @@ def cache(ttl: int = 300):
     return decorator
 
 
-def rate_limit(max_calls: int = 100, window: int = 60):
-    """Rate limiting decorator"""
+def validate_input(**validators) -> Callable:
+    """
+    Decorator to validate function inputs
+    """
     def decorator(func: Callable) -> Callable:
-        call_history = {}
-        
         @functools.wraps(func)
         async def async_wrapper(*args, **kwargs):
-            # Get caller identifier (this is simplified)
-            caller_id = str(args) + str(kwargs)
-            current_time = time.time()
-            
-            # Clean old calls
-            if caller_id in call_history:
-                call_history[caller_id] = [
-                    call_time for call_time in call_history[caller_id]
-                    if current_time - call_time < window
-                ]
-            else:
-                call_history[caller_id] = []
-            
-            # Check rate limit
-            if len(call_history[caller_id]) >= max_calls:
-                raise RateLimitError(f"Rate limit exceeded for {func.__name__}")
-            
-            # Record call
-            call_history[caller_id].append(current_time)
+            # Validate kwargs
+            for param_name, validator in validators.items():
+                if param_name in kwargs:
+                    value = kwargs[param_name]
+                    if not validator(value):
+                        raise ValueError(f"Invalid value for parameter {param_name}: {value}")
             
             return await func(*args, **kwargs)
         
         @functools.wraps(func)
         def sync_wrapper(*args, **kwargs):
-            # Get caller identifier (this is simplified)
-            caller_id = str(args) + str(kwargs)
-            current_time = time.time()
-            
-            # Clean old calls
-            if caller_id in call_history:
-                call_history[caller_id] = [
-                    call_time for call_time in call_history[caller_id]
-                    if current_time - call_time < window
-                ]
-            else:
-                call_history[caller_id] = []
-            
-            # Check rate limit
-            if len(call_history[caller_id]) >= max_calls:
-                raise RateLimitError(f"Rate limit exceeded for {func.__name__}")
-            
-            # Record call
-            call_history[caller_id].append(current_time)
+            # Validate kwargs
+            for param_name, validator in validators.items():
+                if param_name in kwargs:
+                    value = kwargs[param_name]
+                    if not validator(value):
+                        raise ValueError(f"Invalid value for parameter {param_name}: {value}")
             
             return func(*args, **kwargs)
         
@@ -193,175 +305,152 @@ def rate_limit(max_calls: int = 100, window: int = 60):
     return decorator
 
 
-def validate_input(schema: type):
-    """Input validation decorator"""
+def rate_limit(calls: int = 10, period: int = 60) -> Callable:
+    """
+    Decorator to rate limit function calls
+    """
     def decorator(func: Callable) -> Callable:
+        call_times = []
+        
         @functools.wraps(func)
         async def async_wrapper(*args, **kwargs):
-            # Validate input using Pydantic schema
-            try:
-                if 'data' in kwargs:
-                    validated_data = schema(**kwargs['data'])
-                    kwargs['data'] = validated_data
-                
-                return await func(*args, **kwargs)
-            except Exception as e:
-                logger.error(f"Input validation failed for {func.__name__}: {e}")
-                raise ValidationError(f"Invalid input: {e}")
+            current_time = time.time()
+            
+            # Clean old call times
+            call_times[:] = [t for t in call_times if current_time - t < period]
+            
+            # Check rate limit
+            if len(call_times) >= calls:
+                raise BaseAPIException(
+                    message=f"Rate limit exceeded: {calls} calls per {period} seconds",
+                    status_code=429,
+                    error_code="RATE_LIMIT_EXCEEDED"
+                )
+            
+            # Add current call time
+            call_times.append(current_time)
+            
+            return await func(*args, **kwargs)
         
         @functools.wraps(func)
         def sync_wrapper(*args, **kwargs):
-            # Validate input using Pydantic schema
-            try:
-                if 'data' in kwargs:
-                    validated_data = schema(**kwargs['data'])
-                    kwargs['data'] = validated_data
-                
-                return func(*args, **kwargs)
-            except Exception as e:
-                logger.error(f"Input validation failed for {func.__name__}: {e}")
-                raise ValidationError(f"Invalid input: {e}")
+            current_time = time.time()
+            
+            # Clean old call times
+            call_times[:] = [t for t in call_times if current_time - t < period]
+            
+            # Check rate limit
+            if len(call_times) >= calls:
+                raise BaseAPIException(
+                    message=f"Rate limit exceeded: {calls} calls per {period} seconds",
+                    status_code=429,
+                    error_code="RATE_LIMIT_EXCEEDED"
+                )
+            
+            # Add current call time
+            call_times.append(current_time)
+            
+            return func(*args, **kwargs)
         
         return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
     
     return decorator
 
 
-def log_execution(log_level: str = "INFO"):
-    """Decorator to log function execution"""
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        async def async_wrapper(*args, **kwargs):
-            log_method = getattr(logger, log_level.lower())
-            log_method(f"Executing {func.__name__} with args: {args}, kwargs: {kwargs}")
-            
-            try:
-                result = await func(*args, **kwargs)
-                log_method(f"Successfully executed {func.__name__}")
-                return result
-            except Exception as e:
-                logger.error(f"Error executing {func.__name__}: {e}")
-                raise
-        
-        @functools.wraps(func)
-        def sync_wrapper(*args, **kwargs):
-            log_method = getattr(logger, log_level.lower())
-            log_method(f"Executing {func.__name__} with args: {args}, kwargs: {kwargs}")
-            
-            try:
-                result = func(*args, **kwargs)
-                log_method(f"Successfully executed {func.__name__}")
-                return result
-            except Exception as e:
-                logger.error(f"Error executing {func.__name__}: {e}")
-                raise
-        
-        return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
+def require_auth(func: Callable) -> Callable:
+    """
+    Decorator to require authentication
+    """
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        # This would typically check for authentication
+        # For now, it's a placeholder
+        return await func(*args, **kwargs)
     
-    return decorator
+    return wrapper
 
 
-def require_permission(permission: str):
-    """Decorator to require specific permissions"""
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            # This is a simplified example
-            # In a real application, you would check the user's permissions
-            user = kwargs.get('current_user')
-            if not user:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Authentication required"
-                )
-            
-            # Check permissions (simplified)
-            if not hasattr(user, 'permissions') or permission not in user.permissions:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Permission '{permission}' required"
-                )
-            
-            return await func(*args, **kwargs)
+def benchmark(func: Callable) -> Callable:
+    """
+    Decorator to benchmark function execution
+    """
+    @functools.wraps(func)
+    async def async_wrapper(*args, **kwargs):
+        start_time = time.time()
+        start_memory = 0  # Would use memory profiling library in production
         
-        return wrapper
+        try:
+            result = await func(*args, **kwargs)
+            
+            end_time = time.time()
+            duration = end_time - start_time
+            
+            logger.info(
+                f"Benchmark - {func.__name__}: {duration:.4f}s",
+                extra={
+                    "function": func.__name__,
+                    "duration": duration,
+                    "args_count": len(args),
+                    "kwargs_count": len(kwargs),
+                }
+            )
+            
+            return result
+            
+        except Exception as e:
+            end_time = time.time()
+            duration = end_time - start_time
+            
+            logger.error(
+                f"Benchmark - {func.__name__} failed after {duration:.4f}s: {e}",
+                extra={
+                    "function": func.__name__,
+                    "duration": duration,
+                    "error": str(e),
+                    "args_count": len(args),
+                    "kwargs_count": len(kwargs),
+                }
+            )
+            
+            raise
     
-    return decorator
-
-
-def require_role(role: str):
-    """Decorator to require specific roles"""
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            # This is a simplified example
-            # In a real application, you would check the user's roles
-            user = kwargs.get('current_user')
-            if not user:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Authentication required"
-                )
+    @functools.wraps(func)
+    def sync_wrapper(*args, **kwargs):
+        start_time = time.time()
+        
+        try:
+            result = func(*args, **kwargs)
             
-            # Check role (simplified)
-            if not hasattr(user, 'role') or user.role != role:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Role '{role}' required"
-                )
+            end_time = time.time()
+            duration = end_time - start_time
             
-            return await func(*args, **kwargs)
-        
-        return wrapper
-    
-    return decorator
-
-
-def handle_exceptions(default_response: Any = None):
-    """Decorator to handle exceptions gracefully"""
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        async def async_wrapper(*args, **kwargs):
-            try:
-                return await func(*args, **kwargs)
-            except Exception as e:
-                logger.error(f"Exception in {func.__name__}: {e}")
-                if default_response is not None:
-                    return default_response
-                raise
-        
-        @functools.wraps(func)
-        def sync_wrapper(*args, **kwargs):
-            try:
-                return func(*args, **kwargs)
-            except Exception as e:
-                logger.error(f"Exception in {func.__name__}: {e}")
-                if default_response is not None:
-                    return default_response
-                raise
-        
-        return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
-    
-    return decorator
-
-
-def sanitize_input(fields: list):
-    """Decorator to sanitize input fields"""
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            # Sanitize specified fields
-            for field in fields:
-                if field in kwargs:
-                    if isinstance(kwargs[field], str):
-                        kwargs[field] = kwargs[field].strip()
-                        # Remove potentially dangerous characters
-                        dangerous_chars = ["<", ">", "&", '"', "'"]
-                        for char in dangerous_chars:
-                            kwargs[field] = kwargs[field].replace(char, "")
+            logger.info(
+                f"Benchmark - {func.__name__}: {duration:.4f}s",
+                extra={
+                    "function": func.__name__,
+                    "duration": duration,
+                    "args_count": len(args),
+                    "kwargs_count": len(kwargs),
+                }
+            )
             
-            return await func(*args, **kwargs)
-        
-        return wrapper
+            return result
+            
+        except Exception as e:
+            end_time = time.time()
+            duration = end_time - start_time
+            
+            logger.error(
+                f"Benchmark - {func.__name__} failed after {duration:.4f}s: {e}",
+                extra={
+                    "function": func.__name__,
+                    "duration": duration,
+                    "error": str(e),
+                    "args_count": len(args),
+                    "kwargs_count": len(kwargs),
+                }
+            )
+            
+            raise
     
-    return decorator
+    return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper

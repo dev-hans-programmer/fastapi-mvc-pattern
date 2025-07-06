@@ -1,356 +1,257 @@
 """
-Product controllers
+Products controllers.
 """
+from fastapi import HTTPException, status
+from typing import List, Optional, Dict, Any
 import logging
-from typing import Dict, Any, List, Optional
-from fastapi import Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_session
-from app.core.exceptions import NotFoundError, ValidationError
 from app.features.products.services import ProductService
-from app.features.products.repositories import ProductRepository
-from app.features.products.types import ProductCreate, ProductUpdate, ProductResponse
-from app.common.responses import success_response, paginated_response, list_response
-from app.common.decorators import timer, log_execution
-from app.core.dependencies import CommonQueryParams
+from app.features.products.types import (
+    ProductCreate, ProductUpdate, ProductResponse, ProductListResponse,
+    ProductSearchResponse, ProductStatsResponse
+)
+from app.features.products.validation import validate_product_create, validate_product_update
+from app.core.exceptions import NotFoundException, ValidationException
+from app.core.thread_pool import run_in_thread
 
 logger = logging.getLogger(__name__)
 
 
 class ProductController:
-    """Product controller"""
+    """Product controller."""
     
-    def __init__(self, session: AsyncSession = Depends(get_session)):
-        self.session = session
-        self.product_repository = ProductRepository(session)
-        self.product_service = ProductService(self.product_repository)
+    def __init__(self, product_service: ProductService):
+        self.product_service = product_service
     
-    @timer
-    @log_execution()
-    async def create_product(self, product_data: ProductCreate) -> Dict[str, Any]:
-        """Create a new product"""
+    async def create_product(self, product_data: ProductCreate) -> ProductResponse:
+        """Create a new product."""
         try:
-            product = await self.product_service.create(product_data)
+            # Validate request
+            validate_product_create(product_data)
             
-            return success_response(
-                data=ProductResponse.from_orm(product).dict(),
-                message="Product created successfully"
+            # Create product
+            product = await self.product_service.create_product(product_data)
+            
+            logger.info(f"Product created successfully: {product.name}")
+            
+            return ProductResponse.from_orm(product)
+        
+        except ValidationException as e:
+            logger.error(f"Validation error in create_product: {e.message}")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=e.message,
             )
-            
         except Exception as e:
-            logger.error(f"Product creation failed: {e}")
-            raise
+            logger.error(f"Error in create_product: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create product",
+            )
     
-    @timer
-    @log_execution()
-    async def get_product(self, product_id: int) -> Dict[str, Any]:
-        """Get product by ID"""
+    async def get_product(self, product_id: int) -> ProductResponse:
+        """Get product by ID."""
         try:
-            product = await self.product_service.get_by_id(product_id)
+            product = await self.product_service.get_product_by_id(product_id)
             
             if not product:
-                raise NotFoundError(f"Product with ID {product_id} not found")
+                raise NotFoundException(f"Product with ID {product_id} not found")
             
-            return success_response(
-                data=ProductResponse.from_orm(product).dict(),
-                message="Product retrieved successfully"
+            return ProductResponse.from_orm(product)
+        
+        except NotFoundException as e:
+            logger.error(f"Product not found: {e.message}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=e.message,
             )
-            
         except Exception as e:
-            logger.error(f"Get product failed: {e}")
-            raise
-    
-    @timer
-    @log_execution()
-    async def get_products(self, params: CommonQueryParams = Depends()) -> Dict[str, Any]:
-        """Get all products with pagination"""
-        try:
-            filters = {}
-            if params.search:
-                # For search, we'll use the search method instead
-                products = await self.product_service.search(
-                    search_term=params.search,
-                    search_fields=["name", "description", "sku"],
-                    skip=params.skip,
-                    limit=params.limit
-                )
-            else:
-                products = await self.product_service.get_all(
-                    skip=params.skip,
-                    limit=params.limit,
-                    order_by=params.sort_by,
-                    order_desc=params.sort_order == "desc"
-                )
-            
-            # Convert to response models
-            product_responses = [ProductResponse.from_orm(product).dict() for product in products]
-            
-            return list_response(
-                data=product_responses,
-                message="Products retrieved successfully"
+            logger.error(f"Error in get_product: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get product",
             )
-            
-        except Exception as e:
-            logger.error(f"Get products failed: {e}")
-            raise
     
-    @timer
-    @log_execution()
-    async def get_products_paginated(
+    async def get_products(
         self,
-        page: int = 1,
-        page_size: int = 20,
+        skip: int = 0,
+        limit: int = 100,
+        search: Optional[str] = None,
         category: Optional[str] = None,
         min_price: Optional[float] = None,
         max_price: Optional[float] = None,
-        in_stock: Optional[bool] = None
-    ) -> Dict[str, Any]:
-        """Get products with pagination and filters"""
+        is_active: Optional[bool] = None,
+    ) -> ProductListResponse:
+        """Get list of products."""
         try:
-            filters = {}
-            if category:
-                filters["category"] = category
-            if in_stock is not None:
-                filters["in_stock"] = in_stock
-            
-            # For price range filtering, we'd need a more sophisticated approach
-            # This is simplified for the example
-            
-            result = await self.product_service.get_paginated(
-                page=page,
-                page_size=page_size,
-                filters=filters,
-                order_by="created_at",
-                order_desc=True
+            products, total = await self.product_service.get_products(
+                skip=skip,
+                limit=limit,
+                search=search,
+                category=category,
+                min_price=min_price,
+                max_price=max_price,
+                is_active=is_active,
             )
             
-            product_responses = [ProductResponse.from_orm(product).dict() for product in result['records']]
+            product_responses = [ProductResponse.from_orm(product) for product in products]
             
-            return {
-                "success": True,
-                "message": "Products retrieved successfully",
-                "data": product_responses,
-                "pagination": result['pagination']
-            }
-            
-        except Exception as e:
-            logger.error(f"Get paginated products failed: {e}")
-            raise
-    
-    @timer
-    @log_execution()
-    async def update_product(self, product_id: int, product_data: ProductUpdate) -> Dict[str, Any]:
-        """Update product"""
-        try:
-            product = await self.product_service.update(product_id, product_data)
-            
-            return success_response(
-                data=ProductResponse.from_orm(product).dict(),
-                message="Product updated successfully"
+            return ProductListResponse(
+                products=product_responses,
+                total=total,
+                skip=skip,
+                limit=limit,
             )
-            
+        
         except Exception as e:
-            logger.error(f"Product update failed: {e}")
-            raise
-    
-    @timer
-    @log_execution()
-    async def delete_product(self, product_id: int) -> Dict[str, Any]:
-        """Delete product"""
-        try:
-            success = await self.product_service.delete(product_id)
-            
-            if not success:
-                raise NotFoundError(f"Product with ID {product_id} not found")
-            
-            return success_response(
-                message="Product deleted successfully"
+            logger.error(f"Error in get_products: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get products",
             )
-            
-        except Exception as e:
-            logger.error(f"Product deletion failed: {e}")
-            raise
     
-    @timer
-    @log_execution()
-    async def get_product_by_sku(self, sku: str) -> Dict[str, Any]:
-        """Get product by SKU"""
+    async def update_product(self, product_id: int, product_data: ProductUpdate) -> ProductResponse:
+        """Update product."""
         try:
-            product = await self.product_service.get_by_sku(sku)
+            # Validate request
+            validate_product_update(product_data)
+            
+            # Update product
+            product = await self.product_service.update_product(product_id, product_data)
             
             if not product:
-                raise NotFoundError(f"Product with SKU {sku} not found")
+                raise NotFoundException(f"Product with ID {product_id} not found")
             
-            return success_response(
-                data=ProductResponse.from_orm(product).dict(),
-                message="Product retrieved successfully"
+            logger.info(f"Product updated successfully: {product.name}")
+            
+            return ProductResponse.from_orm(product)
+        
+        except NotFoundException as e:
+            logger.error(f"Product not found: {e.message}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=e.message,
             )
-            
+        except ValidationException as e:
+            logger.error(f"Validation error in update_product: {e.message}")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=e.message,
+            )
         except Exception as e:
-            logger.error(f"Get product by SKU failed: {e}")
-            raise
+            logger.error(f"Error in update_product: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update product",
+            )
     
-    @timer
-    @log_execution()
-    async def get_products_by_category(self, category: str) -> Dict[str, Any]:
-        """Get products by category"""
+    async def delete_product(self, product_id: int) -> Dict[str, str]:
+        """Delete product."""
         try:
-            products = await self.product_service.get_products_by_category(category)
+            success = await self.product_service.delete_product(product_id)
             
-            product_responses = [ProductResponse.from_orm(product).dict() for product in products]
+            if not success:
+                raise NotFoundException(f"Product with ID {product_id} not found")
             
-            return list_response(
-                data=product_responses,
-                message=f"Products in category '{category}' retrieved successfully"
+            logger.info(f"Product deleted successfully: {product_id}")
+            
+            return {"message": "Product deleted successfully"}
+        
+        except NotFoundException as e:
+            logger.error(f"Product not found: {e.message}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=e.message,
             )
-            
         except Exception as e:
-            logger.error(f"Get products by category failed: {e}")
-            raise
+            logger.error(f"Error in delete_product: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to delete product",
+            )
     
-    @timer
-    @log_execution()
-    async def search_products(
-        self,
-        search_term: str,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Dict[str, Any]:
-        """Search products"""
+    async def search_products(self, query: str, limit: int = 10) -> ProductSearchResponse:
+        """Search products."""
         try:
-            products = await self.product_service.search(
-                search_term=search_term,
-                search_fields=["name", "description", "sku"],
-                skip=skip,
-                limit=limit
+            products = await self.product_service.search_products(query, limit)
+            
+            product_responses = [ProductResponse.from_orm(product) for product in products]
+            
+            return ProductSearchResponse(
+                products=product_responses,
+                total=len(product_responses),
+                search_term=query,
             )
-            
-            product_responses = [ProductResponse.from_orm(product).dict() for product in products]
-            
-            return list_response(
-                data=product_responses,
-                message="Product search completed"
-            )
-            
+        
         except Exception as e:
-            logger.error(f"Product search failed: {e}")
-            raise
+            logger.error(f"Error in search_products: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to search products",
+            )
     
-    @timer
-    @log_execution()
-    async def update_product_stock(self, product_id: int, quantity: int) -> Dict[str, Any]:
-        """Update product stock"""
+    async def get_product_categories(self) -> List[str]:
+        """Get all product categories."""
         try:
-            product = await self.product_service.update_stock(product_id, quantity)
-            
-            return success_response(
-                data=ProductResponse.from_orm(product).dict(),
-                message="Product stock updated successfully"
-            )
-            
+            categories = await self.product_service.get_product_categories()
+            return categories
+        
         except Exception as e:
-            logger.error(f"Product stock update failed: {e}")
-            raise
+            logger.error(f"Error in get_product_categories: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get product categories",
+            )
     
-    @timer
-    @log_execution()
-    async def get_low_stock_products(self, threshold: int = 10) -> Dict[str, Any]:
-        """Get products with low stock"""
+    @run_in_thread
+    def get_product_stats(self, product_id: int) -> ProductStatsResponse:
+        """Get product statistics (CPU-intensive operation)."""
         try:
-            products = await self.product_service.get_low_stock_products(threshold)
+            stats = self.product_service.calculate_product_stats(product_id)
             
-            product_responses = [ProductResponse.from_orm(product).dict() for product in products]
+            if not stats:
+                raise NotFoundException(f"Product with ID {product_id} not found")
             
-            return list_response(
-                data=product_responses,
-                message=f"Products with stock below {threshold} retrieved successfully"
+            return stats
+        
+        except NotFoundException as e:
+            logger.error(f"Product not found: {e.message}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=e.message,
             )
-            
         except Exception as e:
-            logger.error(f"Get low stock products failed: {e}")
-            raise
+            logger.error(f"Error in get_product_stats: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get product statistics",
+            )
     
-    @timer
-    @log_execution()
-    async def get_product_statistics(self) -> Dict[str, Any]:
-        """Get product statistics"""
+    async def update_product_inventory(self, product_id: int, quantity: int) -> Dict[str, Any]:
+        """Update product inventory."""
         try:
-            stats = await self.product_service.get_product_statistics()
+            success = await self.product_service.update_product_inventory(product_id, quantity)
             
-            return success_response(
-                data=stats,
-                message="Product statistics retrieved successfully"
+            if not success:
+                raise NotFoundException(f"Product with ID {product_id} not found")
+            
+            logger.info(f"Product inventory updated: {product_id}, quantity: {quantity}")
+            
+            return {
+                "message": "Product inventory updated successfully",
+                "product_id": product_id,
+                "new_quantity": quantity,
+            }
+        
+        except NotFoundException as e:
+            logger.error(f"Product not found: {e.message}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=e.message,
             )
-            
         except Exception as e:
-            logger.error(f"Get product statistics failed: {e}")
-            raise
-    
-    @timer
-    @log_execution()
-    async def bulk_create_products(self, products_data: List[ProductCreate]) -> Dict[str, Any]:
-        """Bulk create products"""
-        try:
-            products = await self.product_service.bulk_create(products_data)
-            
-            product_responses = [ProductResponse.from_orm(product).dict() for product in products]
-            
-            return success_response(
-                data=product_responses,
-                message=f"Successfully created {len(products)} products"
+            logger.error(f"Error in update_product_inventory: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update product inventory",
             )
-            
-        except Exception as e:
-            logger.error(f"Bulk product creation failed: {e}")
-            raise
-    
-    @timer
-    @log_execution()
-    async def bulk_update_products(self, updates: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Bulk update products"""
-        try:
-            updated_count = await self.product_service.bulk_update(updates)
-            
-            return success_response(
-                data={"updated_count": updated_count},
-                message=f"Successfully updated {updated_count} products"
-            )
-            
-        except Exception as e:
-            logger.error(f"Bulk product update failed: {e}")
-            raise
-    
-    @timer
-    @log_execution()
-    async def get_featured_products(self, limit: int = 10) -> Dict[str, Any]:
-        """Get featured products"""
-        try:
-            products = await self.product_service.get_featured_products(limit)
-            
-            product_responses = [ProductResponse.from_orm(product).dict() for product in products]
-            
-            return list_response(
-                data=product_responses,
-                message="Featured products retrieved successfully"
-            )
-            
-        except Exception as e:
-            logger.error(f"Get featured products failed: {e}")
-            raise
-    
-    @timer
-    @log_execution()
-    async def toggle_product_availability(self, product_id: int) -> Dict[str, Any]:
-        """Toggle product availability"""
-        try:
-            product = await self.product_service.toggle_availability(product_id)
-            
-            return success_response(
-                data=ProductResponse.from_orm(product).dict(),
-                message=f"Product availability {'enabled' if product.is_available else 'disabled'}"
-            )
-            
-        except Exception as e:
-            logger.error(f"Toggle product availability failed: {e}")
-            raise

@@ -1,3 +1,3 @@
 """
-User management feature
+Users feature package.
 """

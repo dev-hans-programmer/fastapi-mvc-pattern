@@ -1,378 +1,342 @@
 """
-Order types and models
+Order types and data models
 """
-from datetime import datetime
+
 from typing import Optional, List, Dict, Any
+from datetime import datetime
+from dataclasses import dataclass
+from enum import Enum
 from decimal import Decimal
-from pydantic import BaseModel, Field, validator
-from sqlalchemy import Column, Integer, String, Numeric, Boolean, DateTime, ForeignKey, JSON, Text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.core.database import Base
-from app.common.validators import BaseValidator
 
 
-class Order(Base):
-    """Order database model"""
-    __tablename__ = "orders"
-    
-    order_number: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
-    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False, index=True)
-    subtotal: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
-    tax_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, nullable=False)
-    shipping_cost: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, nullable=False)
-    discount_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, nullable=False)
-    total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
-    currency: Mapped[str] = mapped_column(String(3), default="USD", nullable=False)
-    
-    # Address information (stored as JSON)
-    shipping_address: Mapped[Optional[Dict]] = mapped_column(JSON, nullable=True)
-    billing_address: Mapped[Optional[Dict]] = mapped_column(JSON, nullable=True)
-    
-    # Payment information
-    payment_method: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    payment_status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
-    payment_reference: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    
-    # Order tracking
-    tracking_number: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    shipped_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    
-    # Notes and metadata
-    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    metadata: Mapped[Optional[Dict]] = mapped_column(JSON, nullable=True)
-    
-    # Relationships
-    items: Mapped[List["OrderItem"]] = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
-    
-    def __repr__(self):
-        return f"<Order(id={self.id}, order_number='{self.order_number}', status='{self.status}')>"
+class OrderStatus(str, Enum):
+    """
+    Order status enumeration
+    """
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    PROCESSING = "processing"
+    SHIPPED = "shipped"
+    DELIVERED = "delivered"
+    CANCELLED = "cancelled"
+    REFUNDED = "refunded"
 
 
-class OrderItem(Base):
-    """Order item database model"""
-    __tablename__ = "order_items"
+class PaymentStatus(str, Enum):
+    """
+    Payment status enumeration
+    """
+    PENDING = "pending"
+    AUTHORIZED = "authorized"
+    CAPTURED = "captured"
+    FAILED = "failed"
+    REFUNDED = "refunded"
+
+
+class PaymentMethod(str, Enum):
+    """
+    Payment method enumeration
+    """
+    CREDIT_CARD = "credit_card"
+    DEBIT_CARD = "debit_card"
+    PAYPAL = "paypal"
+    BANK_TRANSFER = "bank_transfer"
+    CASH_ON_DELIVERY = "cash_on_delivery"
+
+
+@dataclass
+class Order:
+    """
+    Order data model
+    """
+    id: str
+    user_id: str
+    status: str = OrderStatus.PENDING
+    subtotal: float = 0.0
+    tax_amount: float = 0.0
+    shipping_cost: float = 0.0
+    discount_amount: float = 0.0
+    total_amount: float = 0.0
+    shipping_address: Optional[Dict[str, Any]] = None
+    billing_address: Optional[Dict[str, Any]] = None
+    payment_method: Optional[str] = None
+    payment_status: str = PaymentStatus.PENDING
+    tracking_number: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    confirmed_at: Optional[datetime] = None
+    shipped_at: Optional[datetime] = None
+    delivered_at: Optional[datetime] = None
+    cancelled_at: Optional[datetime] = None
     
-    order_id: Mapped[int] = mapped_column(Integer, ForeignKey("orders.id"), nullable=False)
-    product_id: Mapped[int] = mapped_column(Integer, ForeignKey("products.id"), nullable=False)
-    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
-    unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
-    total_price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    def __post_init__(self):
+        if self.shipping_address is None:
+            self.shipping_address = {}
+        if self.billing_address is None:
+            self.billing_address = {}
     
-    # Product information at time of order (snapshot)
-    product_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    product_sku: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    @property
+    def is_active(self) -> bool:
+        """
+        Check if order is active (not cancelled or delivered)
+        """
+        return self.status not in [OrderStatus.CANCELLED, OrderStatus.DELIVERED, OrderStatus.REFUNDED]
     
-    # Relationships
-    order: Mapped["Order"] = relationship("Order", back_populates="items")
+    @property
+    def can_be_cancelled(self) -> bool:
+        """
+        Check if order can be cancelled
+        """
+        return self.status in [OrderStatus.PENDING, OrderStatus.CONFIRMED]
     
-    def __repr__(self):
-        return f"<OrderItem(id={self.id}, order_id={self.order_id}, product_id={self.product_id})>"
-
-
-class AddressBase(BaseModel):
-    """Base address model"""
-    name: str = Field(..., description="Full name")
-    street_address: str = Field(..., description="Street address")
-    city: str = Field(..., description="City")
-    state: str = Field(..., description="State/Province")
-    postal_code: str = Field(..., description="Postal/ZIP code")
-    country: str = Field(..., description="Country")
-    phone: Optional[str] = Field(None, description="Phone number")
+    @property
+    def can_be_shipped(self) -> bool:
+        """
+        Check if order can be shipped
+        """
+        return self.status == OrderStatus.CONFIRMED
     
-    @validator('name', 'street_address', 'city', 'state', 'country')
-    def validate_required_fields(cls, v):
-        if not v or not v.strip():
-            raise ValueError("Field cannot be empty")
-        return v.strip()
+    @property
+    def can_be_delivered(self) -> bool:
+        """
+        Check if order can be marked as delivered
+        """
+        return self.status == OrderStatus.SHIPPED
     
-    @validator('postal_code')
-    def validate_postal_code(cls, v):
-        if not v or not v.strip():
-            raise ValueError("Postal code cannot be empty")
-        # Basic validation - could be more specific per country
-        return v.strip()
-
-
-class OrderItemBase(BaseModel):
-    """Base order item model"""
-    product_id: int = Field(..., description="Product ID")
-    quantity: int = Field(..., gt=0, description="Quantity")
+    def calculate_total(self) -> float:
+        """
+        Calculate total order amount
+        """
+        return self.subtotal + self.tax_amount + self.shipping_cost - self.discount_amount
     
-    @validator('quantity')
-    def validate_quantity(cls, v):
-        if v <= 0:
-            raise ValueError("Quantity must be greater than 0")
-        if v > 1000:
-            raise ValueError("Quantity cannot exceed 1000")
-        return v
-
-
-class OrderItemCreate(OrderItemBase):
-    """Order item creation model"""
-    pass
-
-
-class OrderItemResponse(BaseModel):
-    """Order item response model"""
-    id: int = Field(..., description="Order item ID")
-    product_id: int = Field(..., description="Product ID")
-    quantity: int = Field(..., description="Quantity")
-    unit_price: float = Field(..., description="Unit price")
-    total_price: float = Field(..., description="Total price")
-    product_name: Optional[str] = Field(None, description="Product name")
-    product_sku: Optional[str] = Field(None, description="Product SKU")
-    
-    class Config:
-        from_attributes = True
-
-
-class OrderBase(BaseModel):
-    """Base order model"""
-    shipping_address: AddressBase = Field(..., description="Shipping address")
-    billing_address: Optional[AddressBase] = Field(None, description="Billing address")
-    payment_method: Optional[str] = Field(None, description="Payment method")
-    notes: Optional[str] = Field(None, description="Order notes")
-    
-    @validator('notes')
-    def validate_notes(cls, v):
-        if v and len(v) > 1000:
-            raise ValueError("Notes cannot exceed 1000 characters")
-        return v
-
-
-class OrderCreate(OrderBase):
-    """Order creation model"""
-    items: List[OrderItemCreate] = Field(..., min_items=1, description="Order items")
-    
-    @validator('items')
-    def validate_items(cls, v):
-        if not v or len(v) == 0:
-            raise ValueError("Order must contain at least one item")
-        return v
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "items": [
-                    {
-                        "product_id": 1,
-                        "quantity": 2
-                    }
-                ],
-                "shipping_address": {
-                    "name": "John Doe",
-                    "street_address": "123 Main St",
-                    "city": "New York",
-                    "state": "NY",
-                    "postal_code": "10001",
-                    "country": "USA",
-                    "phone": "+1234567890"
-                },
-                "payment_method": "credit_card",
-                "notes": "Please deliver after 6 PM"
-            }
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert order to dictionary
+        """
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "status": self.status,
+            "subtotal": self.subtotal,
+            "tax_amount": self.tax_amount,
+            "shipping_cost": self.shipping_cost,
+            "discount_amount": self.discount_amount,
+            "total_amount": self.total_amount,
+            "shipping_address": self.shipping_address,
+            "billing_address": self.billing_address,
+            "payment_method": self.payment_method,
+            "payment_status": self.payment_status,
+            "tracking_number": self.tracking_number,
+            "notes": self.notes,
+            "is_active": self.is_active,
+            "can_be_cancelled": self.can_be_cancelled,
+            "can_be_shipped": self.can_be_shipped,
+            "can_be_delivered": self.can_be_delivered,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "confirmed_at": self.confirmed_at.isoformat() if self.confirmed_at else None,
+            "shipped_at": self.shipped_at.isoformat() if self.shipped_at else None,
+            "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
+            "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None,
         }
 
 
-class OrderUpdate(BaseModel):
-    """Order update model"""
-    shipping_address: Optional[AddressBase] = Field(None, description="Shipping address")
-    billing_address: Optional[AddressBase] = Field(None, description="Billing address")
-    payment_method: Optional[str] = Field(None, description="Payment method")
-    notes: Optional[str] = Field(None, description="Order notes")
+@dataclass
+class OrderItem:
+    """
+    Order item data model
+    """
+    id: str
+    order_id: str
+    product_id: str
+    product_name: str
+    quantity: int
+    price: float
+    total: float
+    product_sku: Optional[str] = None
+    product_attributes: Optional[Dict[str, Any]] = None
     
-    @validator('notes')
-    def validate_notes(cls, v):
-        if v and len(v) > 1000:
-            raise ValueError("Notes cannot exceed 1000 characters")
-        return v
+    def __post_init__(self):
+        if self.product_attributes is None:
+            self.product_attributes = {}
     
-    class Config:
-        schema_extra = {
-            "example": {
-                "notes": "Updated delivery instructions",
-                "payment_method": "paypal"
-            }
+    def calculate_total(self) -> float:
+        """
+        Calculate item total
+        """
+        return self.price * self.quantity
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert item to dictionary
+        """
+        return {
+            "id": self.id,
+            "order_id": self.order_id,
+            "product_id": self.product_id,
+            "product_name": self.product_name,
+            "product_sku": self.product_sku,
+            "quantity": self.quantity,
+            "price": self.price,
+            "total": self.total,
+            "product_attributes": self.product_attributes,
         }
 
 
-class OrderResponse(BaseModel):
-    """Order response model"""
-    id: int = Field(..., description="Order ID")
-    order_number: str = Field(..., description="Order number")
-    user_id: int = Field(..., description="User ID")
-    status: str = Field(..., description="Order status")
-    subtotal: float = Field(..., description="Subtotal")
-    tax_amount: float = Field(..., description="Tax amount")
-    shipping_cost: float = Field(..., description="Shipping cost")
-    discount_amount: float = Field(..., description="Discount amount")
-    total_amount: float = Field(..., description="Total amount")
-    currency: str = Field(..., description="Currency")
-    shipping_address: Optional[Dict] = Field(None, description="Shipping address")
-    billing_address: Optional[Dict] = Field(None, description="Billing address")
-    payment_method: Optional[str] = Field(None, description="Payment method")
-    payment_status: str = Field(..., description="Payment status")
-    payment_reference: Optional[str] = Field(None, description="Payment reference")
-    tracking_number: Optional[str] = Field(None, description="Tracking number")
-    shipped_at: Optional[datetime] = Field(None, description="Shipped timestamp")
-    delivered_at: Optional[datetime] = Field(None, description="Delivered timestamp")
-    notes: Optional[str] = Field(None, description="Order notes")
-    items: List[OrderItemResponse] = Field(default_factory=list, description="Order items")
-    created_at: datetime = Field(..., description="Creation timestamp")
-    updated_at: datetime = Field(..., description="Last update timestamp")
+@dataclass
+class OrderStatusHistory:
+    """
+    Order status history data model
+    """
+    id: str
+    order_id: str
+    status: str
+    notes: Optional[str] = None
+    created_at: Optional[datetime] = None
+    created_by: Optional[str] = None
     
-    class Config:
-        from_attributes = True
-        schema_extra = {
-            "example": {
-                "id": 1,
-                "order_number": "ORD-20240101-A1B2",
-                "user_id": 1,
-                "status": "pending",
-                "subtotal": 99.99,
-                "tax_amount": 8.00,
-                "shipping_cost": 9.99,
-                "discount_amount": 0.00,
-                "total_amount": 117.98,
-                "currency": "USD",
-                "shipping_address": {
-                    "name": "John Doe",
-                    "street_address": "123 Main St",
-                    "city": "New York",
-                    "state": "NY",
-                    "postal_code": "10001",
-                    "country": "USA"
-                },
-                "payment_method": "credit_card",
-                "payment_status": "pending",
-                "created_at": "2024-01-01T00:00:00",
-                "updated_at": "2024-01-01T00:00:00"
-            }
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert status history to dictionary
+        """
+        return {
+            "id": self.id,
+            "order_id": self.order_id,
+            "status": self.status,
+            "notes": self.notes,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "created_by": self.created_by,
         }
 
 
-class OrderListResponse(BaseModel):
-    """Order list response model"""
-    orders: list[OrderResponse] = Field(..., description="List of orders")
-    total_count: int = Field(..., description="Total number of orders")
+@dataclass
+class OrderPayment:
+    """
+    Order payment data model
+    """
+    id: str
+    order_id: str
+    amount: float
+    payment_method: str
+    payment_status: str = PaymentStatus.PENDING
+    transaction_id: Optional[str] = None
+    gateway_response: Optional[Dict[str, Any]] = None
+    created_at: Optional[datetime] = None
+    processed_at: Optional[datetime] = None
     
-    class Config:
-        schema_extra = {
-            "example": {
-                "orders": [
-                    {
-                        "id": 1,
-                        "order_number": "ORD-20240101-A1B2",
-                        "status": "pending",
-                        "total_amount": 117.98,
-                        "created_at": "2024-01-01T00:00:00"
-                    }
-                ],
-                "total_count": 1
-            }
+    def __post_init__(self):
+        if self.gateway_response is None:
+            self.gateway_response = {}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert payment to dictionary
+        """
+        return {
+            "id": self.id,
+            "order_id": self.order_id,
+            "amount": self.amount,
+            "payment_method": self.payment_method,
+            "payment_status": self.payment_status,
+            "transaction_id": self.transaction_id,
+            "gateway_response": self.gateway_response,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "processed_at": self.processed_at.isoformat() if self.processed_at else None,
         }
 
 
-class OrderStatistics(BaseModel):
-    """Order statistics model"""
-    total_orders: int = Field(..., description="Total number of orders")
-    status_counts: Dict[str, int] = Field(..., description="Orders count by status")
-    revenue_statistics: Dict[str, Any] = Field(..., description="Revenue statistics")
-    recent_orders_count: int = Field(..., description="Recent orders count")
-    average_order_value: float = Field(..., description="Average order value")
+@dataclass
+class OrderShipment:
+    """
+    Order shipment data model
+    """
+    id: str
+    order_id: str
+    tracking_number: str
+    carrier: str
+    shipped_at: Optional[datetime] = None
+    estimated_delivery: Optional[datetime] = None
+    delivered_at: Optional[datetime] = None
     
-    class Config:
-        schema_extra = {
-            "example": {
-                "total_orders": 1000,
-                "status_counts": {
-                    "pending": 50,
-                    "confirmed": 100,
-                    "processing": 75,
-                    "shipped": 200,
-                    "delivered": 500,
-                    "cancelled": 75
-                },
-                "revenue_statistics": {
-                    "total_revenue": 50000.00,
-                    "average_order_value": 125.50,
-                    "monthly_revenue": {
-                        "2024-01": 15000.00,
-                        "2024-02": 18000.00,
-                        "2024-03": 17000.00
-                    }
-                },
-                "recent_orders_count": 150,
-                "average_order_value": 125.50
-            }
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert shipment to dictionary
+        """
+        return {
+            "id": self.id,
+            "order_id": self.order_id,
+            "tracking_number": self.tracking_number,
+            "carrier": self.carrier,
+            "shipped_at": self.shipped_at.isoformat() if self.shipped_at else None,
+            "estimated_delivery": self.estimated_delivery.isoformat() if self.estimated_delivery else None,
+            "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
         }
 
 
-class OrderStatusUpdate(BaseModel):
-    """Order status update model"""
-    status: str = Field(..., description="New order status")
-    tracking_number: Optional[str] = Field(None, description="Tracking number")
-    notes: Optional[str] = Field(None, description="Status update notes")
+@dataclass
+class Address:
+    """
+    Address data model
+    """
+    street: str
+    city: str
+    state: str
+    postal_code: str
+    country: str
+    apartment: Optional[str] = None
     
-    @validator('status')
-    def validate_status(cls, v):
-        valid_statuses = ['pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled']
-        if v not in valid_statuses:
-            raise ValueError(f"Status must be one of: {', '.join(valid_statuses)}")
-        return v
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "status": "shipped",
-                "tracking_number": "TRK123456789",
-                "notes": "Package shipped via FedEx"
-            }
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert address to dictionary
+        """
+        return {
+            "street": self.street,
+            "apartment": self.apartment,
+            "city": self.city,
+            "state": self.state,
+            "postal_code": self.postal_code,
+            "country": self.country,
         }
-
-
-class OrderSummary(BaseModel):
-    """Order summary model"""
-    order_id: int = Field(..., description="Order ID")
-    order_number: str = Field(..., description="Order number")
-    status: str = Field(..., description="Order status")
-    total_amount: float = Field(..., description="Total amount")
-    item_count: int = Field(..., description="Number of items")
-    created_at: datetime = Field(..., description="Creation timestamp")
     
-    class Config:
-        schema_extra = {
-            "example": {
-                "order_id": 1,
-                "order_number": "ORD-20240101-A1B2",
-                "status": "pending",
-                "total_amount": 117.98,
-                "item_count": 3,
-                "created_at": "2024-01-01T00:00:00"
-            }
-        }
+    def __str__(self) -> str:
+        """
+        Format address as string
+        """
+        parts = [self.street]
+        if self.apartment:
+            parts.append(f"Apt {self.apartment}")
+        parts.extend([self.city, self.state, self.postal_code, self.country])
+        return ", ".join(parts)
 
 
-class PaymentInfo(BaseModel):
-    """Payment information model"""
-    payment_method: str = Field(..., description="Payment method")
-    payment_status: str = Field(..., description="Payment status")
-    payment_reference: Optional[str] = Field(None, description="Payment reference")
-    amount: float = Field(..., description="Payment amount")
-    currency: str = Field(..., description="Currency")
-    processed_at: Optional[datetime] = Field(None, description="Payment processed timestamp")
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "payment_method": "credit_card",
-                "payment_status": "completed",
-                "payment_reference": "PAY123456789",
-                "amount": 117.98,
-                "currency": "USD",
-                "processed_at": "2024-01-01T12:00:00"
-            }
-        }
+# Order constants
+class OrderFields:
+    """
+    Order field constants for queries and validation
+    """
+    ID = "id"
+    USER_ID = "user_id"
+    STATUS = "status"
+    TOTAL_AMOUNT = "total_amount"
+    CREATED_AT = "created_at"
+    UPDATED_AT = "updated_at"
+
+
+# Status transition rules
+ORDER_STATUS_TRANSITIONS = {
+    OrderStatus.PENDING: [OrderStatus.CONFIRMED, OrderStatus.CANCELLED],
+    OrderStatus.CONFIRMED: [OrderStatus.PROCESSING, OrderStatus.SHIPPED, OrderStatus.CANCELLED],
+    OrderStatus.PROCESSING: [OrderStatus.SHIPPED, OrderStatus.CANCELLED],
+    OrderStatus.SHIPPED: [OrderStatus.DELIVERED],
+    OrderStatus.DELIVERED: [OrderStatus.REFUNDED],
+    OrderStatus.CANCELLED: [],
+    OrderStatus.REFUNDED: [],
+}
+
+
+def can_transition_status(current_status: str, new_status: str) -> bool:
+    """
+    Check if status transition is allowed
+    """
+    return new_status in ORDER_STATUS_TRANSITIONS.get(current_status, [])

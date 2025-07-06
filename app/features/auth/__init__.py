@@ -1,3 +1,3 @@
 """
-Authentication feature module
+Authentication feature package.
 """

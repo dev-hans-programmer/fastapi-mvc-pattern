@@ -1,374 +1,291 @@
 """
-Product repositories
+Products repositories.
 """
+from typing import List, Optional, Tuple, Dict, Any
+from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_, func, desc
+from datetime import datetime
 import logging
-from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
-from sqlalchemy import select, update, func, and_, or_
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.common.base_repository import BaseRepository
-from app.features.products.types import Product
+from app.models.product import Product
+from app.core.exceptions import NotFoundException
 
 logger = logging.getLogger(__name__)
 
 
-class ProductRepository(BaseRepository[Product]):
-    """Product repository"""
+class ProductRepository:
+    """Product repository."""
     
-    def __init__(self, session: AsyncSession):
-        super().__init__(session, Product)
+    def __init__(self, db: Session):
+        self.db = db
     
-    async def get_by_sku(self, sku: str) -> Optional[Product]:
-        """Get product by SKU"""
+    async def create(self, product_data: dict) -> Product:
+        """Create a new product."""
         try:
-            return await self.get_by_field("sku", sku)
+            product = Product(**product_data)
+            self.db.add(product)
+            self.db.commit()
+            self.db.refresh(product)
+            return product
         except Exception as e:
-            logger.error(f"Error getting product by SKU: {e}")
+            logger.error(f"Error creating product: {str(e)}")
+            self.db.rollback()
             raise
     
-    async def get_products_by_category(self, category: str) -> List[Product]:
-        """Get products by category"""
+    async def get_by_id(self, product_id: int) -> Optional[Product]:
+        """Get product by ID."""
         try:
-            return await self.get_all(filters={"category": category})
+            return self.db.query(Product).filter(Product.id == product_id).first()
         except Exception as e:
-            logger.error(f"Error getting products by category: {e}")
+            logger.error(f"Error getting product by ID: {str(e)}")
             raise
     
-    async def get_available_products(self, limit: int = None) -> List[Product]:
-        """Get available products"""
+    def get_by_id_sync(self, product_id: int) -> Optional[Product]:
+        """Get product by ID (synchronous version for thread pool)."""
         try:
-            return await self.get_all(
-                filters={"is_available": True},
-                limit=limit or 1000
-            )
+            return self.db.query(Product).filter(Product.id == product_id).first()
         except Exception as e:
-            logger.error(f"Error getting available products: {e}")
+            logger.error(f"Error getting product by ID (sync): {str(e)}")
             raise
     
-    async def get_featured_products(self, limit: int = 10) -> List[Product]:
-        """Get featured products"""
+    async def get_by_name(self, name: str) -> Optional[Product]:
+        """Get product by name."""
         try:
-            return await self.get_all(
-                filters={"is_featured": True, "is_available": True},
-                limit=limit,
-                order_by="created_at",
-                order_desc=True
-            )
+            return self.db.query(Product).filter(Product.name == name).first()
         except Exception as e:
-            logger.error(f"Error getting featured products: {e}")
+            logger.error(f"Error getting product by name: {str(e)}")
             raise
     
-    async def get_low_stock_products(self, threshold: int = 10) -> List[Product]:
-        """Get products with low stock"""
-        try:
-            stmt = select(self.model).where(
-                and_(
-                    self.model.stock_quantity <= threshold,
-                    self.model.stock_quantity > 0,
-                    self.model.is_available == True
-                )
-            )
-            
-            result = await self.session.execute(stmt)
-            return result.scalars().all()
-            
-        except Exception as e:
-            logger.error(f"Error getting low stock products: {e}")
-            raise
-    
-    async def get_out_of_stock_products(self) -> List[Product]:
-        """Get out of stock products"""
-        try:
-            return await self.get_all(filters={"stock_quantity": 0})
-        except Exception as e:
-            logger.error(f"Error getting out of stock products: {e}")
-            raise
-    
-    async def search_products(
+    async def get_multi(
         self,
-        search_term: str,
         skip: int = 0,
-        limit: int = 100
-    ) -> List[Product]:
-        """Search products by name, description, or SKU"""
+        limit: int = 100,
+        search: Optional[str] = None,
+        category: Optional[str] = None,
+        min_price: Optional[float] = None,
+        max_price: Optional[float] = None,
+        is_active: Optional[bool] = None,
+    ) -> Tuple[List[Product], int]:
+        """Get multiple products with pagination and filtering."""
         try:
-            stmt = select(self.model).where(
-                or_(
-                    self.model.name.ilike(f"%{search_term}%"),
-                    self.model.description.ilike(f"%{search_term}%"),
-                    self.model.sku.ilike(f"%{search_term}%")
-                )
-            ).offset(skip).limit(limit)
+            query = self.db.query(Product)
             
-            result = await self.session.execute(stmt)
-            return result.scalars().all()
-            
-        except Exception as e:
-            logger.error(f"Error searching products: {e}")
-            raise
-    
-    async def search_products_advanced(
-        self,
-        search_term: str = None,
-        category: str = None,
-        min_price: float = None,
-        max_price: float = None,
-        in_stock: bool = None,
-        is_featured: bool = None,
-        skip: int = 0,
-        limit: int = 100
-    ) -> List[Product]:
-        """Advanced product search with filters"""
-        try:
-            stmt = select(self.model)
-            conditions = []
-            
-            # Text search
-            if search_term:
-                conditions.append(
+            # Apply filters
+            if search:
+                search_term = f"%{search}%"
+                query = query.filter(
                     or_(
-                        self.model.name.ilike(f"%{search_term}%"),
-                        self.model.description.ilike(f"%{search_term}%"),
-                        self.model.sku.ilike(f"%{search_term}%")
+                        Product.name.ilike(search_term),
+                        Product.description.ilike(search_term),
                     )
                 )
             
-            # Category filter
             if category:
-                conditions.append(self.model.category == category)
+                query = query.filter(Product.category == category)
             
-            # Price range filter
             if min_price is not None:
-                conditions.append(self.model.price >= min_price)
+                query = query.filter(Product.price >= min_price)
             
             if max_price is not None:
-                conditions.append(self.model.price <= max_price)
+                query = query.filter(Product.price <= max_price)
             
-            # Stock filter
-            if in_stock is not None:
-                if in_stock:
-                    conditions.append(self.model.stock_quantity > 0)
-                else:
-                    conditions.append(self.model.stock_quantity == 0)
+            if is_active is not None:
+                query = query.filter(Product.is_active == is_active)
             
-            # Featured filter
-            if is_featured is not None:
-                conditions.append(self.model.is_featured == is_featured)
+            # Get total count
+            total = query.count()
             
-            if conditions:
-                stmt = stmt.where(and_(*conditions))
+            # Apply pagination
+            products = query.offset(skip).limit(limit).all()
             
-            stmt = stmt.offset(skip).limit(limit)
-            
-            result = await self.session.execute(stmt)
-            return result.scalars().all()
-            
+            return products, total
+        
         except Exception as e:
-            logger.error(f"Error in advanced product search: {e}")
+            logger.error(f"Error getting multiple products: {str(e)}")
             raise
     
-    async def get_products_by_price_range(
-        self,
-        min_price: float,
-        max_price: float,
-        limit: int = 100
-    ) -> List[Product]:
-        """Get products within a price range"""
+    async def update(self, product_id: int, update_data: dict) -> Optional[Product]:
+        """Update product."""
         try:
-            stmt = select(self.model).where(
-                and_(
-                    self.model.price >= min_price,
-                    self.model.price <= max_price,
-                    self.model.is_available == True
+            product = self.db.query(Product).filter(Product.id == product_id).first()
+            if not product:
+                return None
+            
+            # Update fields
+            for field, value in update_data.items():
+                if hasattr(product, field):
+                    setattr(product, field, value)
+            
+            product.updated_at = datetime.utcnow()
+            self.db.commit()
+            self.db.refresh(product)
+            
+            return product
+        
+        except Exception as e:
+            logger.error(f"Error updating product: {str(e)}")
+            self.db.rollback()
+            raise
+    
+    async def delete(self, product_id: int) -> bool:
+        """Delete product."""
+        try:
+            product = self.db.query(Product).filter(Product.id == product_id).first()
+            if not product:
+                return False
+            
+            self.db.delete(product)
+            self.db.commit()
+            return True
+        
+        except Exception as e:
+            logger.error(f"Error deleting product: {str(e)}")
+            self.db.rollback()
+            raise
+    
+    async def search_products(self, search_term: str, limit: int = 10) -> List[Product]:
+        """Search products by name or description."""
+        try:
+            search_pattern = f"%{search_term}%"
+            return (
+                self.db.query(Product)
+                .filter(
+                    and_(
+                        Product.is_active == True,
+                        or_(
+                            Product.name.ilike(search_pattern),
+                            Product.description.ilike(search_pattern),
+                        )
+                    )
                 )
-            ).limit(limit)
-            
-            result = await self.session.execute(stmt)
-            return result.scalars().all()
-            
+                .limit(limit)
+                .all()
+            )
         except Exception as e:
-            logger.error(f"Error getting products by price range: {e}")
+            logger.error(f"Error searching products: {str(e)}")
             raise
     
-    async def get_product_categories(self) -> List[str]:
-        """Get distinct product categories"""
+    async def get_categories(self) -> List[str]:
+        """Get all product categories."""
         try:
-            stmt = select(self.model.category).distinct()
-            result = await self.session.execute(stmt)
-            return [row[0] for row in result.fetchall() if row[0]]
-            
+            result = (
+                self.db.query(Product.category)
+                .filter(Product.is_active == True)
+                .distinct()
+                .all()
+            )
+            return [row[0] for row in result if row[0]]
         except Exception as e:
-            logger.error(f"Error getting product categories: {e}")
+            logger.error(f"Error getting categories: {str(e)}")
             raise
     
-    async def get_product_stats(self) -> Dict[str, Any]:
-        """Get product statistics"""
+    async def get_by_category(self, category: str, limit: int = 100) -> List[Product]:
+        """Get products by category."""
         try:
-            total_products = await self.count()
-            available_products = await self.count({"is_available": True})
-            featured_products = await self.count({"is_featured": True})
-            
-            # Get stock statistics
-            stock_stats = await self.session.execute(
-                select(
-                    func.sum(self.model.stock_quantity).label('total_stock'),
-                    func.avg(self.model.stock_quantity).label('avg_stock'),
-                    func.min(self.model.stock_quantity).label('min_stock'),
-                    func.max(self.model.stock_quantity).label('max_stock')
+            return (
+                self.db.query(Product)
+                .filter(
+                    and_(
+                        Product.category == category,
+                        Product.is_active == True,
+                    )
                 )
+                .limit(limit)
+                .all()
             )
-            stock_result = stock_stats.first()
+        except Exception as e:
+            logger.error(f"Error getting products by category: {str(e)}")
+            raise
+    
+    async def update_inventory(self, product_id: int, quantity: int) -> bool:
+        """Update product inventory."""
+        try:
+            product = self.db.query(Product).filter(Product.id == product_id).first()
+            if not product:
+                return False
             
-            # Get price statistics
-            price_stats = await self.session.execute(
-                select(
-                    func.avg(self.model.price).label('avg_price'),
-                    func.min(self.model.price).label('min_price'),
-                    func.max(self.model.price).label('max_price')
-                ).where(self.model.is_available == True)
-            )
-            price_result = price_stats.first()
+            product.inventory_count = quantity
+            product.updated_at = datetime.utcnow()
+            self.db.commit()
+            
+            return True
+        
+        except Exception as e:
+            logger.error(f"Error updating inventory: {str(e)}")
+            self.db.rollback()
+            raise
+    
+    def calculate_product_stats_sync(self, product_id: int) -> Dict[str, Any]:
+        """Calculate product statistics (synchronous for thread pool)."""
+        try:
+            # This would typically perform complex calculations
+            # For now, return mock data
+            product = self.db.query(Product).filter(Product.id == product_id).first()
+            if not product:
+                return {}
             
             return {
-                "total_products": total_products,
-                "available_products": available_products,
-                "unavailable_products": total_products - available_products,
-                "featured_products": featured_products,
-                "stock_statistics": {
-                    "total_stock": int(stock_result.total_stock or 0),
-                    "average_stock": float(stock_result.avg_stock or 0),
-                    "minimum_stock": int(stock_result.min_stock or 0),
-                    "maximum_stock": int(stock_result.max_stock or 0)
-                },
-                "price_statistics": {
-                    "average_price": float(price_result.avg_price or 0),
-                    "minimum_price": float(price_result.min_price or 0),
-                    "maximum_price": float(price_result.max_price or 0)
-                }
+                "total_orders": 0,
+                "total_revenue": 0.0,
+                "average_rating": 0.0,
+                "view_count": 0,
+                "inventory_level": product.inventory_count,
+                "last_order_date": None,
             }
-            
+        
         except Exception as e:
-            logger.error(f"Error getting product stats: {e}")
+            logger.error(f"Error calculating product stats: {str(e)}")
             raise
     
-    async def get_stock_statistics(self) -> Dict[str, Any]:
-        """Get detailed stock statistics"""
+    async def get_featured_products(self, limit: int = 10) -> List[Product]:
+        """Get featured products."""
         try:
-            # Get products with different stock levels
-            zero_stock = await self.count({"stock_quantity": 0})
-            low_stock = len(await self.get_low_stock_products(10))
-            
-            # Get total stock value
-            stock_value_result = await self.session.execute(
-                select(
-                    func.sum(self.model.stock_quantity * self.model.price).label('total_value')
-                ).where(self.model.is_available == True)
+            return (
+                self.db.query(Product)
+                .filter(
+                    and_(
+                        Product.is_active == True,
+                        Product.is_featured == True,
+                    )
+                )
+                .order_by(desc(Product.created_at))
+                .limit(limit)
+                .all()
             )
-            total_stock_value = stock_value_result.scalar() or 0
-            
-            return {
-                "zero_stock_products": zero_stock,
-                "low_stock_products": low_stock,
-                "total_stock_value": float(total_stock_value)
-            }
-            
         except Exception as e:
-            logger.error(f"Error getting stock statistics: {e}")
+            logger.error(f"Error getting featured products: {str(e)}")
             raise
     
-    async def check_sku_exists(self, sku: str, exclude_product_id: int = None) -> bool:
-        """Check if SKU exists"""
+    async def get_low_stock_products(self, threshold: int = 10) -> List[Product]:
+        """Get products with low stock."""
         try:
-            stmt = select(func.count(self.model.id)).where(
-                self.model.sku == sku
+            return (
+                self.db.query(Product)
+                .filter(
+                    and_(
+                        Product.is_active == True,
+                        Product.inventory_count <= threshold,
+                    )
+                )
+                .order_by(Product.inventory_count)
+                .all()
             )
-            
-            if exclude_product_id:
-                stmt = stmt.where(self.model.id != exclude_product_id)
-            
-            result = await self.session.execute(stmt)
-            return result.scalar() > 0
-            
         except Exception as e:
-            logger.error(f"Error checking SKU existence: {e}")
+            logger.error(f"Error getting low stock products: {str(e)}")
             raise
     
-    async def update_stock_quantity(self, product_id: int, quantity: int) -> bool:
-        """Update product stock quantity"""
+    async def get_popular_products(self, limit: int = 10) -> List[Product]:
+        """Get popular products based on orders."""
         try:
-            stmt = update(self.model).where(
-                self.model.id == product_id
-            ).values(stock_quantity=quantity)
-            
-            result = await self.session.execute(stmt)
-            await self.session.commit()
-            
-            return result.rowcount > 0
-            
+            # This would typically join with orders table
+            # For now, return products ordered by created_at
+            return (
+                self.db.query(Product)
+                .filter(Product.is_active == True)
+                .order_by(desc(Product.created_at))
+                .limit(limit)
+                .all()
+            )
         except Exception as e:
-            await self.session.rollback()
-            logger.error(f"Error updating stock quantity: {e}")
-            raise
-    
-    async def bulk_update_prices(self, price_updates: List[Dict[str, Any]]) -> int:
-        """Bulk update product prices"""
-        try:
-            updated_count = 0
-            
-            for update in price_updates:
-                if 'id' not in update or 'price' not in update:
-                    continue
-                
-                stmt = update(self.model).where(
-                    self.model.id == update['id']
-                ).values(price=update['price'])
-                
-                result = await self.session.execute(stmt)
-                updated_count += result.rowcount
-            
-            await self.session.commit()
-            return updated_count
-            
-        except Exception as e:
-            await self.session.rollback()
-            logger.error(f"Error bulk updating prices: {e}")
-            raise
-    
-    async def get_products_for_export(self, filters: Dict[str, Any] = None) -> List[Product]:
-        """Get products for export with optional filters"""
-        try:
-            return await self.get_all(filters=filters, limit=10000)
-        except Exception as e:
-            logger.error(f"Error getting products for export: {e}")
-            raise
-    
-    async def get_recently_added_products(self, days: int = 7, limit: int = 20) -> List[Product]:
-        """Get recently added products"""
-        try:
-            cutoff_date = datetime.utcnow() - timedelta(days=days)
-            
-            stmt = select(self.model).where(
-                self.model.created_at >= cutoff_date
-            ).order_by(self.model.created_at.desc()).limit(limit)
-            
-            result = await self.session.execute(stmt)
-            return result.scalars().all()
-            
-        except Exception as e:
-            logger.error(f"Error getting recently added products: {e}")
-            raise
-    
-    async def get_products_updated_since(self, since_date: datetime) -> List[Product]:
-        """Get products updated since a specific date"""
-        try:
-            stmt = select(self.model).where(
-                self.model.updated_at >= since_date
-            ).order_by(self.model.updated_at.desc())
-            
-            result = await self.session.execute(stmt)
-            return result.scalars().all()
-            
-        except Exception as e:
-            logger.error(f"Error getting products updated since date: {e}")
+            logger.error(f"Error getting popular products: {str(e)}")
             raise
