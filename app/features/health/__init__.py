@@ -1,3 +1,3 @@
 """
-Health check feature module
+Health check feature package.
 """
